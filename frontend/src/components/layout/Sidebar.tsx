@@ -16,12 +16,10 @@ import {
   FileText,
   Shield,
   Database,
-  Info,
   Menu,
   X,
   PanelLeftClose,
   PanelLeft,
-  AlertTriangle,
 } from 'lucide-react'
 import { useAuthStore } from '@/store/authStore'
 import { useUIStore } from '@/store/uiStore'
@@ -54,11 +52,6 @@ const adminNavItems: NavItem[] = [
   { icon: FileText, label: '系统日志', path: '/admin/logs', adminOnly: true },
   { icon: Shield, label: '风控日志', path: '/admin/risk-logs', adminOnly: true },
   { icon: Database, label: '数据管理', path: '/admin/data', adminOnly: true },
-]
-
-const bottomNavItems: NavItem[] = [
-  { icon: AlertTriangle, label: '免责声明', path: '/disclaimer' },
-  { icon: Info, label: '关于', path: '/about' },
 ]
 
 export function Sidebar() {
@@ -189,18 +182,6 @@ export function Sidebar() {
               ))}
             </>
           )}
-
-          {(sidebarMobileOpen || !sidebarCollapsed) && (
-            <div className="pt-4 pb-2 px-3">
-              <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-                其他
-              </p>
-            </div>
-          )}
-          {(!sidebarMobileOpen && sidebarCollapsed) && <div className="pt-2 border-t border-slate-200 dark:border-slate-700 mt-2" />}
-          {bottomNavItems.map((item) => (
-            <NavItemComponent key={item.path} item={item} />
-          ))}
         </nav>
 
         {/* Collapse toggle button - 只在 lg 以上显示 */}

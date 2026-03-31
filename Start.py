@@ -158,6 +158,26 @@ def _check_and_install_playwright():
     # 检查Playwright浏览器是否存在
     playwright_installed = False
     possible_paths = []
+
+    def _find_browser_executable(browser_root: Path):
+        """查找不同平台/版本布局下的 Playwright Chromium 可执行文件"""
+        candidate_patterns = [
+            'chrome-win/chrome.exe',
+            'chrome-win/headless_shell.exe',
+            'chrome-linux/chrome',
+            'chrome-linux/headless_shell',
+            'chrome-mac/Chromium.app/Contents/MacOS/Chromium',
+            'chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium',
+            'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+            'chrome-headless-shell-mac/chrome-headless-shell',
+            'chrome-headless-shell-mac-arm64/chrome-headless-shell',
+        ]
+
+        for pattern in candidate_patterns:
+            candidate = browser_root / pattern
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        return None
     
     # 如果是打包后的exe，优先检查exe同目录
     if getattr(sys, 'frozen', False):
@@ -201,20 +221,29 @@ def _check_and_install_playwright():
         appdata = os.getenv('APPDATA')
         if appdata:
             possible_paths.append(Path(appdata) / 'ms-playwright')
-    
+    elif sys.platform == 'darwin':
+        # Playwright 在 macOS 上默认缓存到 ~/Library/Caches/ms-playwright
+        possible_paths.append(Path.home() / 'Library' / 'Caches' / 'ms-playwright')
+    else:
+        # Linux / 其他 Unix 环境的常见缓存目录
+        possible_paths.append(Path.home() / '.cache' / 'ms-playwright')
+
+    current_browsers_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH')
+    if current_browsers_path:
+        possible_paths.insert(0, Path(current_browsers_path))
+
     # 检查是否存在chromium浏览器
     for path in possible_paths:
         if path.exists():
-            # 查找chromium目录
-            chromium_dirs = list(path.glob('chromium-*'))
+            # 查找 chromium / headless shell 目录，兼容不同平台布局
+            chromium_dirs = sorted(path.glob('chromium*'))
             if chromium_dirs:
                 for chromium_dir in chromium_dirs:
-                    chrome_win = chromium_dir / 'chrome-win'
-                    chrome_exe = chrome_win / 'chrome.exe'
-                    if chrome_exe.exists():
-                        print(f"{_OK} 找到Playwright浏览器: {chrome_exe}")
-                        # 设置环境变量
+                    browser_exe = _find_browser_executable(chromium_dir)
+                    if browser_exe:
+                        print(f"{_OK} 找到Playwright浏览器: {browser_exe}")
                         os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(path)
+                        print(f"{_INFO} 已设置PLAYWRIGHT_BROWSERS_PATH: {path}")
                         playwright_installed = True
                         break
                 if playwright_installed:
@@ -446,15 +475,16 @@ def _start_api_server():
     """后台线程启动 FastAPI 服务"""
     api_conf = AUTO_REPLY.get('api', {})
 
-    # 优先使用环境变量配置
-    host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
-    port = int(os.getenv('API_PORT', '8080'))  # 默认端口8080
+    # 默认值 -> 配置文件 -> 环境变量，确保运行时可覆盖静态配置
+    host = api_conf.get('host', '0.0.0.0')
+    port = api_conf.get('port', 8080)
 
-    # 如果配置文件中有特定配置，则使用配置文件
-    if 'host' in api_conf:
-        host = api_conf['host']
-    if 'port' in api_conf:
-        port = api_conf['port']
+    env_host = os.getenv('API_HOST')
+    env_port = os.getenv('API_PORT')
+    if env_host:
+        host = env_host
+    if env_port:
+        port = int(env_port)
 
     # 兼容旧的URL配置方式
     if 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:

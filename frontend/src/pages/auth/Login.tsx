@@ -2,12 +2,11 @@ import { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { MessageSquare, User, Lock, Mail, KeyRound, Eye, EyeOff, Sun, Moon } from 'lucide-react'
-import { login, verifyToken, getRegistrationStatus, getLoginInfoStatus, generateCaptcha, verifyCaptcha, sendVerificationCode, getLoginCaptchaStatus } from '@/api/auth'
+import { login, verifyToken, getRegistrationStatus, getLoginInfoStatus, generateCaptcha, verifyCaptcha, sendVerificationCode } from '@/api/auth'
 import { useAuthStore } from '@/store/authStore'
 import { useUIStore } from '@/store/uiStore'
 import { cn } from '@/utils/cn'
 import { ButtonLoading } from '@/components/common/Loading'
-import { GeetestCaptcha, type GeetestResult } from '@/components/common/GeetestCaptcha'
 
 type LoginType = 'username' | 'email-password' | 'email-code'
 
@@ -22,7 +21,6 @@ export function Login() {
   const [registrationEnabled, setRegistrationEnabled] = useState(true)
   const [showDefaultLogin, setShowDefaultLogin] = useState(true)
   const [isDark, setIsDark] = useState(false)
-  const [loginCaptchaEnabled, setLoginCaptchaEnabled] = useState(true)
 
   // Form states
   const [username, setUsername] = useState('')
@@ -39,16 +37,6 @@ export function Login() {
   const [captchaVerified, setCaptchaVerified] = useState(false)
   const [countdown, setCountdown] = useState(0)
   const [verifying, setVerifying] = useState(false)
-
-  // 极验滑动验证码状态
-  const [geetestResult, setGeetestResult] = useState<GeetestResult | null>(null)
-  const [geetestKey, setGeetestKey] = useState(0)
-
-  // 重置滑动验证码
-  const resetGeetest = () => {
-    setGeetestResult(null)
-    setGeetestKey((k) => k + 1)
-  }
 
   // 初始化主题
   useEffect(() => {
@@ -83,12 +71,6 @@ export function Login() {
   useEffect(() => {
     getRegistrationStatus().then((result) => setRegistrationEnabled(result.enabled)).catch(() => {})
     getLoginInfoStatus().then((result) => setShowDefaultLogin(result.enabled)).catch(() => {})
-    getLoginCaptchaStatus().then((result) => {
-      console.log('getLoginCaptchaStatus result:', result)
-      setLoginCaptchaEnabled(result.enabled)
-    }).catch((err) => {
-      console.error('getLoginCaptchaStatus error:', err)
-    })
   }, [])
 
   useEffect(() => {
@@ -156,10 +138,6 @@ export function Login() {
     }
   }
 
-  useEffect(() => { resetGeetest() }, [loginType])
-
-  const handleGeetestSuccess = (result: GeetestResult) => { setGeetestResult(result) }
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
@@ -167,12 +145,10 @@ export function Login() {
       let loginData: any = {}
       if (loginType === 'username') {
         if (!username || !password) { addToast({ type: 'error', message: '请输入用户名和密码' }); setLoading(false); return }
-        if (loginCaptchaEnabled && !geetestResult) { addToast({ type: 'error', message: '请完成滑动验证' }); setLoading(false); return }
-        loginData = { username, password, geetest_challenge: geetestResult?.challenge, geetest_validate: geetestResult?.validate, geetest_seccode: geetestResult?.seccode }
+        loginData = { username, password }
       } else if (loginType === 'email-password') {
         if (!email || !emailPassword) { addToast({ type: 'error', message: '请输入邮箱和密码' }); setLoading(false); return }
-        if (loginCaptchaEnabled && !geetestResult) { addToast({ type: 'error', message: '请完成滑动验证' }); setLoading(false); return }
-        loginData = { email, password: emailPassword, geetest_challenge: geetestResult?.challenge, geetest_validate: geetestResult?.validate, geetest_seccode: geetestResult?.seccode }
+        loginData = { email, password: emailPassword }
       } else {
         if (!emailForCode || !verificationCode) { addToast({ type: 'error', message: '请输入邮箱和验证码' }); setLoading(false); return }
         loginData = { email: emailForCode, verification_code: verificationCode }
@@ -184,11 +160,9 @@ export function Login() {
         navigate('/dashboard')
       } else {
         addToast({ type: 'error', message: result.message || '登录失败' })
-        resetGeetest()
       }
     } catch {
       addToast({ type: 'error', message: '登录失败，请检查网络连接' })
-      resetGeetest()
     } finally {
       setLoading(false)
     }
@@ -234,12 +208,10 @@ export function Login() {
               {loginType === 'username' && (<>
                 <div className="input-group"><label className="input-label">用户名</label><div className="relative"><User className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type="text" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="请输入用户名" className="input-ios pl-9" /></div></div>
                 <div className="input-group"><label className="input-label">密码</label><div className="relative"><Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="请输入密码" className="input-ios pl-9 pr-9" /><button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">{showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}</button></div></div>
-                {loginCaptchaEnabled && (<div className="input-group"><label className="input-label">滑动验证</label><GeetestCaptcha key={`username-${geetestKey}`} onSuccess={handleGeetestSuccess} onError={(err) => addToast({ type: 'error', message: err })} disabled={loading} /></div>)}
               </>)}
               {loginType === 'email-password' && (<>
                 <div className="input-group"><label className="input-label">邮箱地址</label><div className="relative"><Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" className="input-ios pl-9" /></div></div>
                 <div className="input-group"><label className="input-label">密码</label><div className="relative"><Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type={showPassword ? 'text' : 'password'} value={emailPassword} onChange={(e) => setEmailPassword(e.target.value)} placeholder="请输入密码" className="input-ios pl-9 pr-9" /><button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">{showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}</button></div></div>
-                {loginCaptchaEnabled && (<div className="input-group"><label className="input-label">滑动验证</label><GeetestCaptcha key={`email-${geetestKey}`} onSuccess={handleGeetestSuccess} onError={(err) => addToast({ type: 'error', message: err })} disabled={loading} /></div>)}
               </>)}
               {loginType === 'email-code' && (<>
                 <div className="input-group"><label className="input-label">邮箱地址</label><div className="relative"><Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" /><input type="email" value={emailForCode} onChange={(e) => setEmailForCode(e.target.value)} placeholder="name@example.com" className="input-ios pl-9" /></div></div>
@@ -251,7 +223,6 @@ export function Login() {
             {registrationEnabled && (<p className="text-center mt-6 text-slate-500 dark:text-slate-400 text-sm">还没有账号？{' '}<Link to="/register" className="text-blue-600 dark:text-blue-400 font-medium hover:text-blue-700 dark:hover:text-blue-300">立即注册</Link></p>)}
             {showDefaultLogin && (<div className="mt-6 pt-6 border-t border-slate-100 dark:border-slate-700"><button type="button" onClick={fillDefaultCredentials} className="w-full flex items-center justify-between p-3 rounded-md bg-slate-50 dark:bg-slate-700/50 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors text-sm"><div className="text-left"><p className="text-slate-500 dark:text-slate-400">演示账号</p><p className="text-slate-900 dark:text-white font-medium">admin / admin123</p></div><span className="text-blue-600 dark:text-blue-400">一键填充 →</span></button></div>)}
           </div>
-          <p className="text-center mt-6 text-slate-400 dark:text-slate-500 text-xs">© {new Date().getFullYear()} 划算云服务器 · <a href="https://www.hsykj.com" target="_blank" rel="noopener noreferrer" className="hover:text-blue-600 dark:hover:text-blue-400 ml-1 transition-colors">www.hsykj.com</a></p>
         </motion.div>
       </div>
     </div>

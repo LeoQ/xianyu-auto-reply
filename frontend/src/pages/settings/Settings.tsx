@@ -338,20 +338,6 @@ export function Settings() {
                 </label>
               </div>
 
-              <div className="flex items-center justify-between py-3 border-t border-slate-100 dark:border-slate-700">
-                <div>
-                  <p className="font-medium text-slate-900 dark:text-slate-100">登录滑动验证码</p>
-                  <p className="text-sm text-slate-500 dark:text-slate-400">开启后账号密码登录需要完成滑动验证</p>
-                </div>
-                <label className="switch-ios">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(settings?.login_captcha_enabled ?? true)}
-                    onChange={(e) => setSettings(s => s ? { ...s, login_captcha_enabled: e.target.checked } : null)}
-                  />
-                  <span className="switch-slider"></span>
-                </label>
-              </div>
             </div>
           </div>
 

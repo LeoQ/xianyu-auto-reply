@@ -359,13 +359,6 @@ export function Register() {
           </p>
         </div>
 
-        {/* Footer */}
-        <p className="text-center mt-6 text-slate-400 text-xs">
-          © {new Date().getFullYear()} 划算云服务器 · 
-          <a href="https://www.hsykj.com" target="_blank" rel="noopener noreferrer" className="hover:text-blue-600 dark:text-blue-400 ml-1 transition-colors">
-            www.hsykj.com
-          </a>
-        </p>
       </div>
     </div>
   )

@@ -20,6 +20,7 @@ interface TabsStore {
   removeTabsToLeft: (path: string) => void
   removeAllTabs: () => void
   setActiveTab: (path: string) => void
+  sanitizeTabs: (validPaths: string[]) => void
 }
 
 // 路由标题映射
@@ -40,8 +41,6 @@ const routeTitles: Record<string, string> = {
   '/admin/logs': '系统日志',
   '/admin/risk-logs': '风控日志',
   '/admin/data': '数据管理',
-  '/disclaimer': '免责声明',
-  '/about': '关于',
 }
 
 export const useTabsStore = create<TabsStore>()(
@@ -110,6 +109,21 @@ export const useTabsStore = create<TabsStore>()(
       },
       
       setActiveTab: (path) => set({ activeTab: path }),
+
+      sanitizeTabs: (validPaths) => {
+        const { tabs, activeTab } = get()
+        const filteredTabs = tabs.filter((tab) => validPaths.includes(tab.path) || tab.path === '/dashboard')
+        const hasDashboard = filteredTabs.some((tab) => tab.path === '/dashboard')
+        const nextTabs = hasDashboard
+          ? filteredTabs
+          : [{ path: '/dashboard', title: '仪表盘', closable: false }, ...filteredTabs]
+        const nextActiveTab = validPaths.includes(activeTab) ? activeTab : '/dashboard'
+
+        set({
+          tabs: nextTabs,
+          activeTab: nextActiveTab,
+        })
+      },
     }),
     {
       name: 'tabs-storage',
@@ -128,7 +142,7 @@ interface ContextMenuState {
 export function TabsBar() {
   const location = useLocation()
   const navigate = useNavigate()
-  const { tabs, activeTab, addTab, removeTab, removeTabsToRight, removeTabsToLeft, removeAllTabs, setActiveTab } = useTabsStore()
+  const { tabs, activeTab, addTab, removeTab, removeTabsToRight, removeTabsToLeft, removeAllTabs, setActiveTab, sanitizeTabs } = useTabsStore()
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false,
     x: 0,
@@ -136,6 +150,10 @@ export function TabsBar() {
     targetPath: ''
   })
   const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    sanitizeTabs(Object.keys(routeTitles))
+  }, [sanitizeTabs])
 
   // 监听路由变化，自动添加标签
   useEffect(() => {

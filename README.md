@@ -1,14 +1,5 @@
 # 爱用不用，风险自担！！！爱用不用，风险自担！！！爱用不用，风险自担！！！
 
-## 交流群
-
-| 微信群 | QQ群 | TG群 |
-|:---:|:---:|:---:|
-| ![微信群](static/wechat-group.png) | ![QQ群](static/qq-group.png) | ![TG群](static/tg-group.png) |
-
-
-
-
 # 🐟 闲鱼自动回复系统
 
 [![GitHub](https://img.shields.io/badge/GitHub-zhinianboke%2Fxianyu--auto--reply-blue?logo=github)](https://github.com/zhinianboke/xianyu-auto-reply)
@@ -173,8 +164,7 @@ xianyu-auto-reply/
 │       ├── uploads/
 │       │   └── images/            # 上传的图片文件
 │       ├── xianyu_js_version_2.js # 闲鱼JavaScript工具库
-│       ├── wechat-group.png       # 微信群二维码
-│       └── qq-group.png           # QQ群二维码
+│       └── favicon.svg            # 网站图标
 ├── 🐳 Docker部署
 │   ├── Dockerfile                 # Docker镜像构建文件（优化版）
 │   ├── Dockerfile-cn             # 国内优化版Docker镜像构建文件
@@ -243,11 +233,6 @@ xianyu-auto-reply/
 - ✅ 支持Oracle Cloud、AWS Graviton等ARM服务器
 - ✅ Docker自动选择匹配的架构，无需手动指定
 - ✅ 国内外双镜像源，确保下载速度
-
-## 🚀 云服务器推荐
-
-### 【划算云】国内外云服务器、全球CDN、挂机宝  www.hsykj.com
-
 
 ## 🚀 快速开始
 
@@ -986,7 +971,7 @@ powershell -ExecutionPolicy Bypass -File docker-deploy.bat
 
 - **项目作者**：zhinianboke
 - **项目地址**：https://github.com/zhinianboke/xianyu-auto-reply
-- **联系方式**：通过GitHub Issues或项目交流群
+- **联系方式**：通过 GitHub Issues
 
 ### ⚠️ 免责声明
 
@@ -1000,13 +985,13 @@ powershell -ExecutionPolicy Bypass -File docker-deploy.bat
 如发现本项目存在侵权内容，请通过以下方式联系：
 
 - **GitHub Issues**：https://github.com/zhinianboke/xianyu-auto-reply/issues
-- **邮箱联系**：在项目交流群中获取联系方式
+- **邮箱联系**：请通过 GitHub Issues 留言说明需求
 
 我们将在收到通知后**立即处理**并删除相关内容。
 
 ### 🤝 合作与授权
 
-如需商业使用或特殊授权，请通过项目交流群联系作者进行协商。
+如需商业使用或特殊授权，请通过 GitHub Issues 联系作者进行协商。
 
 ---
 
