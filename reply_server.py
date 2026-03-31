@@ -3153,7 +3153,7 @@ def get_public_system_settings():
 
 
 @app.get('/system-settings')
-def get_system_settings(_: None = Depends(require_auth)):
+def get_system_settings(_: Dict[str, Any] = Depends(require_admin)):
     """获取系统设置（排除敏感信息）"""
     from db_manager import db_manager
     try:
@@ -3167,7 +3167,7 @@ def get_system_settings(_: None = Depends(require_auth)):
 
 
 @app.put('/system-settings/{key}')
-def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Depends(require_auth)):
+def update_system_setting(key: str, setting_data: SystemSettingIn, _: Dict[str, Any] = Depends(require_admin)):
     """更新系统设置"""
     from db_manager import db_manager
     try:

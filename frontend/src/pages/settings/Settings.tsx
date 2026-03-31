@@ -11,6 +11,7 @@ import type { SystemSettings, Account } from '@/types'
 export function Settings() {
   const { addToast } = useUIStore()
   const { isAuthenticated, token, _hasHydrated, user } = useAuthStore()
+  const isAdmin = Boolean(user?.is_admin)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [settings, setSettings] = useState<SystemSettings | null>(null)
@@ -42,7 +43,10 @@ export function Settings() {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
 
   const loadSettings = async () => {
-    if (!_hasHydrated || !isAuthenticated || !token) return
+    if (!_hasHydrated || !isAuthenticated || !token || !isAdmin) {
+      setLoading(false)
+      return
+    }
     try {
       setLoading(true)
       const result = await getSystemSettings()
@@ -58,10 +62,19 @@ export function Settings() {
 
   useEffect(() => {
     if (!_hasHydrated || !isAuthenticated || !token) return
+    if (!isAdmin) {
+      setLoading(false)
+      setSettings(null)
+      return
+    }
     loadSettings()
-  }, [_hasHydrated, isAuthenticated, token])
+  }, [_hasHydrated, isAuthenticated, token, isAdmin])
 
   const handleSave = async () => {
+    if (!isAdmin) {
+      addToast({ type: 'error', message: '仅管理员可修改系统设置' })
+      return
+    }
     if (!settings) return
     try {
       setSaving(true)
@@ -80,6 +93,11 @@ export function Settings() {
 
   // 加载账号列表
   const loadAccounts = async () => {
+    if (!isAdmin) {
+      setAccounts([])
+      setTestAccountId('')
+      return
+    }
     try {
       const data = await getAccounts()
       setAccounts(data)
@@ -92,12 +110,16 @@ export function Settings() {
   }
 
   useEffect(() => {
-    if (_hasHydrated && isAuthenticated && token) {
+    if (_hasHydrated && isAuthenticated && token && isAdmin) {
       loadAccounts()
     }
-  }, [_hasHydrated, isAuthenticated, token])
+  }, [_hasHydrated, isAuthenticated, token, isAdmin])
 
   const handleTestAI = async () => {
+    if (!isAdmin) {
+      addToast({ type: 'error', message: '仅管理员可测试 AI 配置' })
+      return
+    }
     if (!testAccountId) {
       addToast({ type: 'warning', message: '请先选择一个账号' })
       return
@@ -123,6 +145,10 @@ export function Settings() {
   }
 
   const handleTestEmail = async () => {
+    if (!isAdmin) {
+      addToast({ type: 'error', message: '仅管理员可测试邮件配置' })
+      return
+    }
     const email = prompt('请输入测试邮箱地址:')
     if (!email) return
     try {
@@ -267,8 +293,6 @@ export function Settings() {
   if (loading) {
     return <PageLoading />
   }
-
-  const isAdmin = user?.is_admin
 
   return (
     <div className="space-y-4">
