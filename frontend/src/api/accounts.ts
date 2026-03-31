@@ -144,6 +144,46 @@ export const checkPasswordLoginStatus = (sessionId: string): Promise<{
 }
 
 // AI 回复设置接口 - 与后端 AIReplySettings 模型对应
+export interface AgentProfile {
+  persona_name?: string
+  tone_tags?: string[]
+  speaking_rules?: string[]
+  forbidden_phrases?: string[]
+  sales_style?: string
+  service_style?: string
+  negotiation_policy?: Record<string, unknown>
+  sample_reply?: string
+  common_endings?: string[]
+  build_mode?: string
+  version?: number
+  status?: string
+  updated_at?: string
+}
+
+export interface AISampleStats {
+  total_samples: number
+  active_samples: number
+  manual_messages: number
+  incoming_messages: number
+  auto_messages: number
+  ai_messages: number
+  human_takeover_rate: number
+  latest_profile_version?: number | null
+  last_profile_status?: string
+  trace_count: number
+}
+
+export interface AITrace {
+  id: number
+  created_at: string
+  intent?: string
+  final_reply?: string
+  raw_reply?: string
+  retrieved_sample_ids?: number[]
+  prompt_version?: string
+  strategy_version?: string
+}
+
 export interface AIReplySettings {
   ai_enabled: boolean
   model_name?: string
@@ -153,6 +193,19 @@ export interface AIReplySettings {
   max_discount_amount?: number
   max_bargain_rounds?: number
   custom_prompts?: string
+  base_prompt_overrides?: string
+  enable_style_learning?: boolean
+  capture_manual_samples?: boolean
+  min_style_samples?: number
+  style_strength?: number
+  allow_auto_bargain?: boolean
+  prefer_human_style?: boolean
+  prompt_version?: string
+  strategy_version?: string
+  agent_profile?: AgentProfile
+  policy_flags?: Record<string, unknown>
+  training_status?: Record<string, unknown>
+  sample_stats?: AISampleStats
   // 兼容旧字段（前端内部使用）
   enabled?: boolean
 }
@@ -164,21 +217,103 @@ export const getAIReplySettings = (cookieId: string): Promise<AIReplySettings> =
 
 // 更新AI回复设置
 export const updateAIReplySettings = (cookieId: string, settings: Partial<AIReplySettings>): Promise<ApiResponse> => {
-  // 转换字段名以匹配后端
-  const payload: Record<string, unknown> = {
-    ai_enabled: settings.ai_enabled ?? settings.enabled ?? false,
-    model_name: settings.model_name ?? 'qwen-plus',
-    api_key: settings.api_key ?? '',
-    base_url: settings.base_url ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    max_discount_percent: settings.max_discount_percent ?? 10,
-    max_discount_amount: settings.max_discount_amount ?? 100,
-    max_bargain_rounds: settings.max_bargain_rounds ?? 3,
-    custom_prompts: settings.custom_prompts ?? '',
+  const payload: Record<string, unknown> = {}
+  const fieldMap: Array<[keyof AIReplySettings, string]> = [
+    ['ai_enabled', 'ai_enabled'],
+    ['model_name', 'model_name'],
+    ['api_key', 'api_key'],
+    ['base_url', 'base_url'],
+    ['max_discount_percent', 'max_discount_percent'],
+    ['max_discount_amount', 'max_discount_amount'],
+    ['max_bargain_rounds', 'max_bargain_rounds'],
+    ['custom_prompts', 'custom_prompts'],
+    ['base_prompt_overrides', 'base_prompt_overrides'],
+    ['enable_style_learning', 'enable_style_learning'],
+    ['capture_manual_samples', 'capture_manual_samples'],
+    ['min_style_samples', 'min_style_samples'],
+    ['style_strength', 'style_strength'],
+    ['allow_auto_bargain', 'allow_auto_bargain'],
+    ['prefer_human_style', 'prefer_human_style'],
+    ['prompt_version', 'prompt_version'],
+    ['strategy_version', 'strategy_version'],
+    ['agent_profile', 'agent_profile'],
+    ['policy_flags', 'policy_flags'],
+    ['training_status', 'training_status'],
+  ]
+
+  fieldMap.forEach(([sourceKey, targetKey]) => {
+    if (Object.prototype.hasOwnProperty.call(settings, sourceKey) && settings[sourceKey] !== undefined) {
+      payload[targetKey] = settings[sourceKey]
+    }
+  })
+
+  if (Object.prototype.hasOwnProperty.call(settings, 'enabled') && settings.enabled !== undefined) {
+    payload.ai_enabled = settings.enabled
   }
+
   return put(`/ai-reply-settings/${cookieId}`, payload)
 }
 
 // 获取所有账号的AI回复设置
 export const getAllAIReplySettings = (): Promise<Record<string, AIReplySettings>> => {
   return get('/ai-reply-settings')
+}
+
+export const rebuildAIReplyProfile = (cookieId: string): Promise<{
+  success: boolean
+  message?: string
+  agent_profile?: AgentProfile
+  training_status?: Record<string, unknown>
+  sample_stats?: AISampleStats
+}> => {
+  return post(`/ai-agent/${cookieId}/rebuild-profile`)
+}
+
+export const getAIAgentStats = (cookieId: string): Promise<{
+  cookie_id: string
+  sample_stats: AISampleStats
+  training_status?: Record<string, unknown>
+  prompt_version?: string
+  strategy_version?: string
+  recent_traces?: AITrace[]
+}> => {
+  return get(`/ai-agent/${cookieId}/stats`)
+}
+
+export const previewAIReplyAgent = async (
+  cookieId: string,
+  params: {
+    message: string
+    item_title?: string
+    item_price?: string | number
+    item_desc?: string
+    item_id?: string
+    chat_id?: string
+    user_id?: string
+  },
+): Promise<{
+  intent: string
+  reply?: string | null
+  raw_reply?: string | null
+  warning?: string
+  compiled_prompt: string
+  system_prompt: string
+  user_prompt: string
+  style_examples: Array<Record<string, unknown>>
+  agent_profile: AgentProfile
+  guard_result?: Record<string, unknown>
+  sample_stats: AISampleStats
+  prompt_version?: string
+  strategy_version?: string
+}> => {
+  const query = new URLSearchParams({
+    message: params.message,
+    item_title: params.item_title ?? '测试商品',
+    item_price: String(params.item_price ?? '100'),
+    item_desc: params.item_desc ?? '这是一个测试商品',
+    item_id: params.item_id ?? 'preview_item',
+    chat_id: params.chat_id ?? 'preview_chat',
+    user_id: params.user_id ?? 'preview_user',
+  })
+  return get(`/ai-agent/${cookieId}/preview?${query.toString()}`)
 }

@@ -167,6 +167,18 @@ class DBManager:
                 max_discount_amount INTEGER DEFAULT 100,
                 max_bargain_rounds INTEGER DEFAULT 3,
                 custom_prompts TEXT,
+                base_prompt_overrides TEXT DEFAULT '',
+                enable_style_learning BOOLEAN DEFAULT FALSE,
+                capture_manual_samples BOOLEAN DEFAULT TRUE,
+                min_style_samples INTEGER DEFAULT 5,
+                style_strength REAL DEFAULT 0.6,
+                allow_auto_bargain BOOLEAN DEFAULT TRUE,
+                prefer_human_style BOOLEAN DEFAULT TRUE,
+                prompt_version TEXT DEFAULT 'v2',
+                strategy_version TEXT DEFAULT 'rag-v1',
+                agent_profile TEXT DEFAULT '',
+                policy_flags TEXT DEFAULT '',
+                training_status TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
@@ -189,6 +201,109 @@ class DBManager:
                 FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
             )
             ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                item_id TEXT,
+                sender_role TEXT NOT NULL,
+                sender_id TEXT,
+                content TEXT NOT NULL,
+                message_type TEXT DEFAULT 'text',
+                reply_source TEXT,
+                is_manual BOOLEAN DEFAULT FALSE,
+                source_event_time TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reply_style_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                item_id TEXT,
+                buyer_message TEXT NOT NULL,
+                human_reply TEXT NOT NULL,
+                source TEXT DEFAULT 'manual',
+                quality_score REAL DEFAULT 0,
+                intent TEXT,
+                embedding TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS agent_profiles (
+                cookie_id TEXT PRIMARY KEY,
+                persona_name TEXT,
+                tone_tags TEXT,
+                speaking_rules TEXT,
+                forbidden_phrases TEXT,
+                sales_style TEXT,
+                service_style TEXT,
+                negotiation_policy TEXT,
+                profile_json TEXT,
+                version INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reply_generation_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                strategy_version TEXT,
+                prompt_version TEXT,
+                intent TEXT,
+                retrieved_sample_ids TEXT,
+                model_name TEXT,
+                compiled_prompt TEXT,
+                raw_reply TEXT,
+                final_reply TEXT,
+                guard_result TEXT,
+                reply_source TEXT DEFAULT 'ai',
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup ON conversation_messages(cookie_id, chat_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_reply_style_samples_lookup ON reply_style_samples(cookie_id, is_active, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_reply_generation_traces_lookup ON reply_generation_traces(cookie_id, chat_id, created_at)')
+
+            ai_settings_columns = [
+                ("base_prompt_overrides", "TEXT DEFAULT ''"),
+                ("enable_style_learning", "BOOLEAN DEFAULT FALSE"),
+                ("capture_manual_samples", "BOOLEAN DEFAULT TRUE"),
+                ("min_style_samples", "INTEGER DEFAULT 5"),
+                ("style_strength", "REAL DEFAULT 0.6"),
+                ("allow_auto_bargain", "BOOLEAN DEFAULT TRUE"),
+                ("prefer_human_style", "BOOLEAN DEFAULT TRUE"),
+                ("prompt_version", "TEXT DEFAULT 'v2'"),
+                ("strategy_version", "TEXT DEFAULT 'rag-v1'"),
+                ("agent_profile", "TEXT DEFAULT ''"),
+                ("policy_flags", "TEXT DEFAULT ''"),
+                ("training_status", "TEXT DEFAULT ''"),
+            ]
+            for column_name, column_def in ai_settings_columns:
+                try:
+                    self._execute_sql(cursor, f"SELECT {column_name} FROM ai_reply_settings LIMIT 1")
+                except sqlite3.OperationalError:
+                    logger.info(f"正在为 ai_reply_settings 表添加 {column_name} 列...")
+                    self._execute_sql(cursor, f"ALTER TABLE ai_reply_settings ADD COLUMN {column_name} {column_def}")
+                    logger.info(f"ai_reply_settings 表 {column_name} 列添加完成")
 
             # 创建AI商品信息缓存表
             cursor.execute('''
@@ -1903,6 +2018,96 @@ class DBManager:
                 return {}
 
     # -------------------- AI回复设置操作 --------------------
+    def _safe_load_json(self, value: Any, default):
+        """安全解析JSON字符串"""
+        if value in (None, ''):
+            if isinstance(default, (dict, list)):
+                return default.copy()
+            return default
+
+        if isinstance(value, (dict, list)):
+            return value
+
+        try:
+            parsed = json.loads(value)
+            return parsed if parsed is not None else default
+        except Exception:
+            if isinstance(default, (dict, list)):
+                return default.copy()
+            return default
+
+    def _safe_dump_json(self, value: Any) -> str:
+        """安全序列化JSON"""
+        if value in (None, ''):
+            return ''
+
+        if isinstance(value, str):
+            return value
+
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return ''
+
+    def _normalize_ai_reply_settings(self, result: tuple, system_model: str, system_api_key: str, system_base_url: str) -> dict:
+        """统一整理AI回复设置"""
+        DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+        DEFAULT_MODEL = 'qwen-plus'
+
+        if result:
+            account_model = result[1]
+            account_api_key = result[2]
+            account_base_url = result[3]
+
+            use_model = account_model if (account_model and account_model != DEFAULT_MODEL) else system_model
+            use_api_key = account_api_key if account_api_key else system_api_key
+            use_base_url = account_base_url if (account_base_url and account_base_url != DEFAULT_BASE_URL) else system_base_url
+
+            custom_prompts = result[7] or ''
+            base_prompt_overrides = result[8] or custom_prompts
+            agent_profile = self._safe_load_json(result[16], {})
+            policy_flags = self._safe_load_json(result[17], {})
+            training_status = self._safe_load_json(result[18], {})
+        else:
+            use_model = system_model
+            use_api_key = system_api_key
+            use_base_url = system_base_url
+            custom_prompts = ''
+            base_prompt_overrides = ''
+            agent_profile = {}
+            policy_flags = {}
+            training_status = {}
+
+        if not policy_flags:
+            policy_flags = {
+                'allow_auto_bargain': bool(result[13]) if result else True,
+                'prefer_human_style': bool(result[14]) if result else True,
+                'capture_manual_samples': bool(result[10]) if result else True,
+            }
+
+        return {
+            'ai_enabled': bool(result[0]) if result else False,
+            'model_name': use_model,
+            'api_key': use_api_key,
+            'base_url': use_base_url,
+            'max_discount_percent': result[4] if result else 10,
+            'max_discount_amount': result[5] if result else 100,
+            'max_bargain_rounds': result[6] if result else 3,
+            'custom_prompts': custom_prompts,
+            'base_prompt_overrides': base_prompt_overrides,
+            'enable_style_learning': bool(result[9]) if result else False,
+            'capture_manual_samples': bool(result[10]) if result else True,
+            'min_style_samples': result[11] if result else 5,
+            'style_strength': float(result[12] if result and result[12] is not None else 0.6),
+            'allow_auto_bargain': bool(result[13]) if result else True,
+            'prefer_human_style': bool(result[14]) if result else True,
+            'prompt_version': result[15] if result and result[15] else 'v2',
+            'strategy_version': result[19] if result and result[19] else 'rag-v1',
+            'agent_profile': agent_profile,
+            'policy_flags': policy_flags,
+            'training_status': training_status,
+        }
+
     def save_ai_reply_settings(self, cookie_id: str, settings: dict) -> bool:
         """保存AI回复设置"""
         with self.lock:
@@ -1912,8 +2117,11 @@ class DBManager:
                 INSERT OR REPLACE INTO ai_reply_settings
                 (cookie_id, ai_enabled, model_name, api_key, base_url,
                  max_discount_percent, max_discount_amount, max_bargain_rounds,
-                 custom_prompts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 custom_prompts, base_prompt_overrides, enable_style_learning,
+                 capture_manual_samples, min_style_samples, style_strength,
+                 allow_auto_bargain, prefer_human_style, prompt_version,
+                 strategy_version, agent_profile, policy_flags, training_status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     cookie_id,
                     settings.get('ai_enabled', False),
@@ -1923,7 +2131,19 @@ class DBManager:
                     settings.get('max_discount_percent', 10),
                     settings.get('max_discount_amount', 100),
                     settings.get('max_bargain_rounds', 3),
-                    settings.get('custom_prompts', '')
+                    settings.get('custom_prompts', ''),
+                    settings.get('base_prompt_overrides', settings.get('custom_prompts', '')),
+                    settings.get('enable_style_learning', False),
+                    settings.get('capture_manual_samples', True),
+                    settings.get('min_style_samples', 5),
+                    settings.get('style_strength', 0.6),
+                    settings.get('allow_auto_bargain', True),
+                    settings.get('prefer_human_style', True),
+                    settings.get('prompt_version', 'v2'),
+                    settings.get('strategy_version', 'rag-v1'),
+                    self._safe_dump_json(settings.get('agent_profile', {})),
+                    self._safe_dump_json(settings.get('policy_flags', {})),
+                    self._safe_dump_json(settings.get('training_status', {})),
                 ))
                 self.conn.commit()
                 logger.debug(f"AI回复设置保存成功: {cookie_id}")
@@ -1949,7 +2169,10 @@ class DBManager:
                 cursor.execute('''
                 SELECT ai_enabled, model_name, api_key, base_url,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, base_prompt_overrides, enable_style_learning,
+                       capture_manual_samples, min_style_samples, style_strength,
+                       allow_auto_bargain, prefer_human_style, prompt_version,
+                       agent_profile, policy_flags, training_status, strategy_version
                 FROM ai_reply_settings WHERE cookie_id = ?
                 ''', (cookie_id,))
 
@@ -1959,40 +2182,12 @@ class DBManager:
                 system_api_key = self.get_system_setting('ai_api_key') or ''
                 system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_BASE_URL
                 system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
-                
-                if result:
-                    # 账号有设置，但如果api_key/base_url/model_name为空或等于默认值，使用系统设置
-                    account_model = result[1]
-                    account_api_key = result[2]
-                    account_base_url = result[3]
-                    
-                    # 如果账号值为空或等于硬编码默认值，则使用系统设置
-                    use_model = account_model if (account_model and account_model != DEFAULT_MODEL) else system_model
-                    use_api_key = account_api_key if account_api_key else system_api_key
-                    use_base_url = account_base_url if (account_base_url and account_base_url != DEFAULT_BASE_URL) else system_base_url
-                    
-                    return {
-                        'ai_enabled': bool(result[0]),
-                        'model_name': use_model,
-                        'api_key': use_api_key,
-                        'base_url': use_base_url,
-                        'max_discount_percent': result[4],
-                        'max_discount_amount': result[5],
-                        'max_bargain_rounds': result[6],
-                        'custom_prompts': result[7]
-                    }
-                else:
-                    # 账号没有设置，使用系统设置作为默认值
-                    return {
-                        'ai_enabled': False,
-                        'model_name': system_model,
-                        'api_key': system_api_key,
-                        'base_url': system_base_url,
-                        'max_discount_percent': 10,
-                        'max_discount_amount': 100,
-                        'max_bargain_rounds': 3,
-                        'custom_prompts': ''
-                    }
+                settings = self._normalize_ai_reply_settings(result, system_model, system_api_key, system_base_url)
+                settings['sample_stats'] = self.get_reply_style_stats(cookie_id)
+                profile = self.get_agent_profile(cookie_id)
+                if profile and not settings.get('agent_profile'):
+                    settings['agent_profile'] = profile
+                return settings
             except Exception as e:
                 logger.error(f"获取AI回复设置失败: {e}")
                 return {
@@ -2003,7 +2198,20 @@ class DBManager:
                     'max_discount_percent': 10,
                     'max_discount_amount': 100,
                     'max_bargain_rounds': 3,
-                    'custom_prompts': ''
+                    'custom_prompts': '',
+                    'base_prompt_overrides': '',
+                    'enable_style_learning': False,
+                    'capture_manual_samples': True,
+                    'min_style_samples': 5,
+                    'style_strength': 0.6,
+                    'allow_auto_bargain': True,
+                    'prefer_human_style': True,
+                    'prompt_version': 'v2',
+                    'strategy_version': 'rag-v1',
+                    'agent_profile': {},
+                    'policy_flags': {},
+                    'training_status': {},
+                    'sample_stats': self.get_reply_style_stats(cookie_id)
                 }
 
     def get_all_ai_reply_settings(self) -> Dict[str, dict]:
@@ -2014,27 +2222,350 @@ class DBManager:
                 cursor.execute('''
                 SELECT cookie_id, ai_enabled, model_name, api_key, base_url,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, base_prompt_overrides, enable_style_learning,
+                       capture_manual_samples, min_style_samples, style_strength,
+                       allow_auto_bargain, prefer_human_style, prompt_version,
+                       agent_profile, policy_flags, training_status, strategy_version
                 FROM ai_reply_settings
                 ''')
+
+                DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+                DEFAULT_MODEL = 'qwen-plus'
+                system_api_key = self.get_system_setting('ai_api_key') or ''
+                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_BASE_URL
+                system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
 
                 result = {}
                 for row in cursor.fetchall():
                     cookie_id = row[0]
-                    result[cookie_id] = {
-                        'ai_enabled': bool(row[1]),
-                        'model_name': row[2],
-                        'api_key': row[3],
-                        'base_url': row[4],
-                        'max_discount_percent': row[5],
-                        'max_discount_amount': row[6],
-                        'max_bargain_rounds': row[7],
-                        'custom_prompts': row[8]
-                    }
+                    normalized = self._normalize_ai_reply_settings(row[1:], system_model, system_api_key, system_base_url)
+                    normalized['sample_stats'] = self.get_reply_style_stats(cookie_id)
+                    result[cookie_id] = normalized
 
                 return result
             except Exception as e:
                 logger.error(f"获取所有AI回复设置失败: {e}")
+                return {}
+
+    def save_conversation_message(self, cookie_id: str, chat_id: str, item_id: str, sender_role: str,
+                                  sender_id: str, content: str, message_type: str = 'text',
+                                  reply_source: str = None, is_manual: bool = False,
+                                  source_event_time: str = None) -> Optional[int]:
+        """保存结构化会话消息"""
+        if not content:
+            return None
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO conversation_messages
+                (cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
+                 reply_source, is_manual, source_event_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    cookie_id, chat_id, item_id, sender_role, sender_id, content,
+                    message_type or 'text', reply_source, bool(is_manual), source_event_time
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"保存结构化会话消息失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_conversation_messages(self, cookie_id: str, chat_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """获取结构化会话消息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
+                       reply_source, is_manual, source_event_time, created_at
+                FROM conversation_messages
+                WHERE cookie_id = ? AND chat_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                ''', (cookie_id, chat_id, limit))
+                rows = cursor.fetchall()
+                columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'sender_role', 'sender_id', 'content',
+                           'message_type', 'reply_source', 'is_manual', 'source_event_time', 'created_at']
+                return [dict(zip(columns, row)) for row in reversed(rows)]
+            except Exception as e:
+                logger.error(f"获取结构化会话消息失败: {e}")
+                return []
+
+    def find_recent_buyer_message(self, cookie_id: str, chat_id: str, before_message_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """获取最近一条买家消息，用于配对人工回复样本"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if before_message_id:
+                    cursor.execute('''
+                    SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
+                           reply_source, is_manual, source_event_time, created_at
+                    FROM conversation_messages
+                    WHERE cookie_id = ? AND chat_id = ? AND sender_role = 'buyer' AND id < ?
+                    ORDER BY id DESC LIMIT 1
+                    ''', (cookie_id, chat_id, before_message_id))
+                else:
+                    cursor.execute('''
+                    SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
+                           reply_source, is_manual, source_event_time, created_at
+                    FROM conversation_messages
+                    WHERE cookie_id = ? AND chat_id = ? AND sender_role = 'buyer'
+                    ORDER BY id DESC LIMIT 1
+                    ''', (cookie_id, chat_id))
+
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'sender_role', 'sender_id', 'content',
+                           'message_type', 'reply_source', 'is_manual', 'source_event_time', 'created_at']
+                return dict(zip(columns, row))
+            except Exception as e:
+                logger.error(f"查找最近买家消息失败: {e}")
+                return None
+
+    def save_reply_style_sample(self, cookie_id: str, chat_id: str, item_id: str, buyer_message: str,
+                                human_reply: str, source: str = 'manual', quality_score: float = 0.0,
+                                intent: str = None, embedding: Any = None, is_active: bool = True) -> Optional[int]:
+        """保存风格样本"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO reply_style_samples
+                (cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
+                 intent, embedding, is_active, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (
+                    cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
+                    intent, self._safe_dump_json(embedding), bool(is_active)
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"保存风格样本失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_reply_style_samples(self, cookie_id: str, limit: int = 50, active_only: bool = True) -> List[Dict[str, Any]]:
+        """获取风格样本"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where_sql = "WHERE cookie_id = ?"
+                params: List[Any] = [cookie_id]
+                if active_only:
+                    where_sql += " AND is_active = 1"
+                cursor.execute(f'''
+                SELECT id, cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
+                       intent, embedding, is_active, created_at, updated_at
+                FROM reply_style_samples
+                {where_sql}
+                ORDER BY quality_score DESC, created_at DESC
+                LIMIT ?
+                ''', (*params, limit))
+                rows = cursor.fetchall()
+                columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'buyer_message', 'human_reply', 'source',
+                           'quality_score', 'intent', 'embedding', 'is_active', 'created_at', 'updated_at']
+                results = []
+                for row in rows:
+                    item = dict(zip(columns, row))
+                    item['embedding'] = self._safe_load_json(item.get('embedding'), [])
+                    results.append(item)
+                return results
+            except Exception as e:
+                logger.error(f"获取风格样本失败: {e}")
+                return []
+
+    def get_reply_style_stats(self, cookie_id: str) -> Dict[str, Any]:
+        """获取风格学习统计"""
+        with self.lock:
+            stats = {
+                'total_samples': 0,
+                'active_samples': 0,
+                'manual_messages': 0,
+                'incoming_messages': 0,
+                'auto_messages': 0,
+                'ai_messages': 0,
+                'human_takeover_rate': 0.0,
+                'latest_profile_version': None,
+                'last_profile_status': 'draft',
+                'trace_count': 0,
+            }
+
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT COUNT(*), SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) FROM reply_style_samples WHERE cookie_id = ?', (cookie_id,))
+                sample_row = cursor.fetchone() or (0, 0)
+                stats['total_samples'] = sample_row[0] or 0
+                stats['active_samples'] = sample_row[1] or 0
+
+                cursor.execute('''
+                SELECT
+                    SUM(CASE WHEN sender_role = 'seller' AND is_manual = 1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN sender_role = 'buyer' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN sender_role = 'seller' AND is_manual = 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN sender_role = 'seller' AND reply_source = 'ai' THEN 1 ELSE 0 END)
+                FROM conversation_messages
+                WHERE cookie_id = ?
+                ''', (cookie_id,))
+                msg_row = cursor.fetchone() or (0, 0, 0, 0)
+                stats['manual_messages'] = msg_row[0] or 0
+                stats['incoming_messages'] = msg_row[1] or 0
+                stats['auto_messages'] = msg_row[2] or 0
+                stats['ai_messages'] = msg_row[3] or 0
+
+                takeover_base = (stats['manual_messages'] + stats['ai_messages']) or 0
+                stats['human_takeover_rate'] = round((stats['manual_messages'] / takeover_base), 4) if takeover_base else 0.0
+
+                cursor.execute('SELECT version, status FROM agent_profiles WHERE cookie_id = ?', (cookie_id,))
+                profile_row = cursor.fetchone()
+                if profile_row:
+                    stats['latest_profile_version'] = profile_row[0]
+                    stats['last_profile_status'] = profile_row[1] or 'ready'
+
+                cursor.execute('SELECT COUNT(*) FROM reply_generation_traces WHERE cookie_id = ?', (cookie_id,))
+                trace_row = cursor.fetchone()
+                stats['trace_count'] = trace_row[0] if trace_row else 0
+
+                return stats
+            except Exception as e:
+                logger.error(f"获取风格学习统计失败: {e}")
+                return stats
+
+    def save_reply_generation_trace(self, cookie_id: str, chat_id: str, trace: Dict[str, Any]) -> Optional[int]:
+        """保存AI回复trace"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO reply_generation_traces
+                (cookie_id, chat_id, strategy_version, prompt_version, intent, retrieved_sample_ids,
+                 model_name, compiled_prompt, raw_reply, final_reply, guard_result, reply_source, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    cookie_id,
+                    chat_id,
+                    trace.get('strategy_version'),
+                    trace.get('prompt_version'),
+                    trace.get('intent'),
+                    self._safe_dump_json(trace.get('retrieved_sample_ids', [])),
+                    trace.get('model_name'),
+                    trace.get('compiled_prompt'),
+                    trace.get('raw_reply'),
+                    trace.get('final_reply'),
+                    self._safe_dump_json(trace.get('guard_result', {})),
+                    trace.get('reply_source', 'ai'),
+                    self._safe_dump_json(trace.get('metadata', {})),
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"保存AI回复trace失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_recent_reply_generation_traces(self, cookie_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """获取最近AI回复trace"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT id, cookie_id, chat_id, strategy_version, prompt_version, intent, retrieved_sample_ids,
+                       model_name, compiled_prompt, raw_reply, final_reply, guard_result, reply_source, metadata, created_at
+                FROM reply_generation_traces
+                WHERE cookie_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                ''', (cookie_id, limit))
+                rows = cursor.fetchall()
+                columns = ['id', 'cookie_id', 'chat_id', 'strategy_version', 'prompt_version', 'intent',
+                           'retrieved_sample_ids', 'model_name', 'compiled_prompt', 'raw_reply', 'final_reply',
+                           'guard_result', 'reply_source', 'metadata', 'created_at']
+                results = []
+                for row in rows:
+                    item = dict(zip(columns, row))
+                    item['retrieved_sample_ids'] = self._safe_load_json(item.get('retrieved_sample_ids'), [])
+                    item['guard_result'] = self._safe_load_json(item.get('guard_result'), {})
+                    item['metadata'] = self._safe_load_json(item.get('metadata'), {})
+                    results.append(item)
+                return results
+            except Exception as e:
+                logger.error(f"获取最近AI回复trace失败: {e}")
+                return []
+
+    def save_agent_profile(self, cookie_id: str, profile: Dict[str, Any], status: str = 'ready') -> bool:
+        """保存账号画像"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT version FROM agent_profiles WHERE cookie_id = ?', (cookie_id,))
+                row = cursor.fetchone()
+                version = (row[0] + 1) if row else 1
+                cursor.execute('''
+                INSERT OR REPLACE INTO agent_profiles
+                (cookie_id, persona_name, tone_tags, speaking_rules, forbidden_phrases,
+                 sales_style, service_style, negotiation_policy, profile_json, version, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (
+                    cookie_id,
+                    profile.get('persona_name'),
+                    self._safe_dump_json(profile.get('tone_tags', [])),
+                    self._safe_dump_json(profile.get('speaking_rules', [])),
+                    self._safe_dump_json(profile.get('forbidden_phrases', [])),
+                    profile.get('sales_style', ''),
+                    profile.get('service_style', ''),
+                    self._safe_dump_json(profile.get('negotiation_policy', {})),
+                    self._safe_dump_json(profile),
+                    version,
+                    status,
+                ))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存账号画像失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_agent_profile(self, cookie_id: str) -> Dict[str, Any]:
+        """获取账号画像"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT persona_name, tone_tags, speaking_rules, forbidden_phrases,
+                       sales_style, service_style, negotiation_policy, profile_json, version, status, updated_at
+                FROM agent_profiles WHERE cookie_id = ?
+                ''', (cookie_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return {}
+
+                profile_json = self._safe_load_json(row[7], {})
+                if profile_json:
+                    profile_json.setdefault('version', row[8])
+                    profile_json.setdefault('status', row[9])
+                    profile_json.setdefault('updated_at', row[10])
+                    return profile_json
+
+                return {
+                    'persona_name': row[0],
+                    'tone_tags': self._safe_load_json(row[1], []),
+                    'speaking_rules': self._safe_load_json(row[2], []),
+                    'forbidden_phrases': self._safe_load_json(row[3], []),
+                    'sales_style': row[4] or '',
+                    'service_style': row[5] or '',
+                    'negotiation_policy': self._safe_load_json(row[6], {}),
+                    'version': row[8],
+                    'status': row[9],
+                    'updated_at': row[10],
+                }
+            except Exception as e:
+                logger.error(f"获取账号画像失败: {e}")
                 return {}
 
     # -------------------- 默认回复操作 --------------------
@@ -2520,7 +3051,9 @@ class DBManager:
 
                         # 备份其他相关表
                         related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations']
+                                        'item_info', 'ai_reply_settings', 'ai_conversations',
+                                        'conversation_messages', 'reply_style_samples',
+                                        'agent_profiles', 'reply_generation_traces']
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2536,7 +3069,9 @@ class DBManager:
                         'cookies', 'keywords', 'cookie_status', 'cards',
                         'delivery_rules', 'default_replies', 'notification_channels',
                         'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache'
+                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                        'conversation_messages', 'reply_style_samples',
+                        'agent_profiles', 'reply_generation_traces'
                     ]
 
                     for table in tables:
@@ -2579,7 +3114,9 @@ class DBManager:
 
                         # 删除用户相关数据
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
+                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings',
+                                        'conversation_messages', 'reply_style_samples',
+                                        'agent_profiles', 'reply_generation_traces']
 
                         for table in related_tables:
                             cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2591,7 +3128,9 @@ class DBManager:
                     tables = [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
+                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache',
+                        'conversation_messages', 'reply_style_samples',
+                        'agent_profiles', 'reply_generation_traces', 'cookies'
                     ]
 
                     for table in tables:
@@ -2606,7 +3145,9 @@ class DBManager:
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
                                         'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                                        'conversation_messages', 'reply_style_samples',
+                                        'agent_profiles', 'reply_generation_traces']:
                         continue
 
                     columns = table_data['columns']
@@ -4704,22 +5245,21 @@ class DBManager:
                 # 4. 删除用户的通知渠道
                 cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
 
-                # 5. 删除用户的Cookie
-                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
-
-                # 6. 删除用户的关键字
+                # 5. 删除用户的关键字与AI相关数据
                 cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
                 cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的AI回复设置
                 cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的消息通知
+                cursor.execute('DELETE FROM ai_conversations WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
+                cursor.execute('DELETE FROM conversation_messages WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
+                cursor.execute('DELETE FROM reply_style_samples WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
+                cursor.execute('DELETE FROM agent_profiles WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
+                cursor.execute('DELETE FROM reply_generation_traces WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
                 cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 10. 最后删除用户本身
+                # 6. 删除用户的Cookie
+                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
+
+                # 7. 最后删除用户本身
                 cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
 
                 # 提交事务
@@ -4979,9 +5519,13 @@ class DBManager:
                     'default_replies': 'id',
                     'default_reply_records': 'id',
                     'item_replay': 'item_id',
-                    'ai_reply_settings': 'id',
+                    'ai_reply_settings': 'cookie_id',
                     'ai_conversations': 'id',
                     'ai_item_cache': 'id',
+                    'conversation_messages': 'id',
+                    'reply_style_samples': 'id',
+                    'agent_profiles': 'cookie_id',
+                    'reply_generation_traces': 'id',
                     'item_info': 'id',
                     'message_notifications': 'id',
                     'cards': 'id',
@@ -5470,6 +6014,26 @@ class DBManager:
                 except Exception as e:
                     logger.warning(f"清理AI对话历史失败: {e}")
                     stats['ai_conversations'] = 0
+
+                try:
+                    cursor.execute(
+                        "DELETE FROM conversation_messages WHERE created_at < datetime('now', '-' || ? || ' days')",
+                        (days,)
+                    )
+                    stats['conversation_messages'] = cursor.rowcount
+                except Exception as e:
+                    logger.warning(f"清理结构化消息失败: {e}")
+                    stats['conversation_messages'] = 0
+
+                try:
+                    cursor.execute(
+                        "DELETE FROM reply_generation_traces WHERE created_at < datetime('now', '-' || ? || ' days')",
+                        (days,)
+                    )
+                    stats['reply_generation_traces'] = cursor.rowcount
+                except Exception as e:
+                    logger.warning(f"清理AI trace失败: {e}")
+                    stats['reply_generation_traces'] = 0
                 
                 # 清理风控日志（保留最近90天）
                 try:

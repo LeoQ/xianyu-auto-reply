@@ -7250,6 +7250,19 @@ class XianyuLive:
                                         await self.send_image_msg(websocket, chat_id, send_user_id, final_image_url, image_width, image_height)
                                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                                         logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {final_image_url}")
+                                        try:
+                                            from ai_reply_engine import ai_reply_engine
+                                            ai_reply_engine.record_auto_reply(
+                                                cookie_id=self.cookie_id,
+                                                chat_id=chat_id,
+                                                user_id=self.myid,
+                                                item_id=item_id,
+                                                content=final_image_url,
+                                                reply_source=reply_source.lower(),
+                                                message_type='image',
+                                            )
+                                        except Exception as record_error:
+                                            logger.error(f"记录自动图片回复失败: {self._safe_str(record_error)}")
                                 except Exception as e:
                                     logger.error(f"【{self.cookie_id}】默认回复图片发送失败: {self._safe_str(e)}")
                             
@@ -7280,6 +7293,19 @@ class XianyuLive:
                         # 记录发出的图片消息
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                         logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {image_url}")
+                        try:
+                            from ai_reply_engine import ai_reply_engine
+                            ai_reply_engine.record_auto_reply(
+                                cookie_id=self.cookie_id,
+                                chat_id=chat_id,
+                                user_id=self.myid,
+                                item_id=item_id,
+                                content=image_url,
+                                reply_source=reply_source.lower(),
+                                message_type='image',
+                            )
+                        except Exception as record_error:
+                            logger.error(f"记录自动图片回复失败: {self._safe_str(record_error)}")
                     except Exception as e:
                         # 图片发送失败，发送错误提示
                         logger.error(f"图片发送失败: {self._safe_str(e)}")
@@ -7292,6 +7318,19 @@ class XianyuLive:
                     # 记录发出的消息
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f"[{msg_time}] 【{reply_source}发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
+                    try:
+                        from ai_reply_engine import ai_reply_engine
+                        ai_reply_engine.record_auto_reply(
+                            cookie_id=self.cookie_id,
+                            chat_id=chat_id,
+                            user_id=self.myid,
+                            item_id=item_id,
+                            content=reply,
+                            reply_source=reply_source.lower(),
+                            message_type='text',
+                        )
+                    except Exception as record_error:
+                        logger.error(f"记录自动文本回复失败: {self._safe_str(record_error)}")
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
@@ -7637,12 +7676,38 @@ class XianyuLive:
             if send_user_id == self.myid:
                 logger.info(f"[{msg_time}] 【手动发出】 商品({item_id}): {send_message}")
 
+                try:
+                    from ai_reply_engine import ai_reply_engine
+                    ai_reply_engine.record_manual_reply(
+                        cookie_id=self.cookie_id,
+                        chat_id=chat_id,
+                        user_id=send_user_id,
+                        item_id=item_id,
+                        content=send_message,
+                        source_event_time=msg_time,
+                    )
+                except Exception as record_error:
+                    logger.error(f"记录手动消息失败: {self._safe_str(record_error)}")
+
                 # 暂停该chat_id的自动回复10分钟
                 pause_manager.pause_chat(chat_id, self.cookie_id)
 
                 return
             else:
                 logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
+
+                try:
+                    from ai_reply_engine import ai_reply_engine
+                    ai_reply_engine.record_incoming_message(
+                        cookie_id=self.cookie_id,
+                        chat_id=chat_id,
+                        user_id=send_user_id,
+                        item_id=item_id,
+                        content=send_message,
+                        source_event_time=msg_time,
+                    )
+                except Exception as record_error:
+                    logger.error(f"记录收到消息失败: {self._safe_str(record_error)}")
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）
                 # 检查是否为群组消息，如果是群组消息则跳过通知
@@ -7736,8 +7801,16 @@ class XianyuLive:
             elif send_message == '已发货':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】发货确认消息不处理')
                 return
+            try:
+                from ai_reply_engine import ai_reply_engine
+                if ai_reply_engine.should_ignore_auto_reply_message(send_message):
+                    logger.info(f'[{msg_time}] 【{self.cookie_id}】命中AI忽略消息规则，不进入自动回复: {send_message}')
+                    return
+            except Exception as ignore_error:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】AI忽略消息规则检查失败: {self._safe_str(ignore_error)}')
+
             # 【重要】检查是否为自动发货触发消息 - 即使在人工接入暂停期间也要处理
-            elif self._is_auto_delivery_trigger(send_message):
+            if self._is_auto_delivery_trigger(send_message):
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到自动发货触发消息，即使在暂停期间也继续处理: {send_message}')
                 # 使用统一的自动发货处理方法
                 await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,

@@ -4799,6 +4799,18 @@ class AIReplySettings(BaseModel):
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
     custom_prompts: str = ""
+    base_prompt_overrides: str = ""
+    enable_style_learning: bool = False
+    capture_manual_samples: bool = True
+    min_style_samples: int = 5
+    style_strength: float = 0.6
+    allow_auto_bargain: bool = True
+    prefer_human_style: bool = True
+    prompt_version: str = "v2"
+    strategy_version: str = "rag-v1"
+    agent_profile: Dict[str, Any] = {}
+    policy_flags: Dict[str, Any] = {}
+    training_status: Dict[str, Any] = {}
 
 
 @app.delete("/items/batch")
@@ -4827,18 +4839,18 @@ def batch_delete_items(
 
 # ==================== AI回复管理API ====================
 
+def _ensure_cookie_access(cookie_id: str, current_user: Dict[str, Any]) -> None:
+    """校验账号归属"""
+    user_id = current_user['user_id']
+    user_cookies = db_manager.get_all_cookies(user_id)
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+
 @app.get("/ai-reply-settings/{cookie_id}")
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的AI回复设置"""
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cookie_id, current_user)
         settings = db_manager.get_ai_reply_settings(cookie_id)
         return settings
     except HTTPException:
@@ -4852,13 +4864,7 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
 def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新指定账号的AI回复设置"""
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        _ensure_cookie_access(cookie_id, current_user)
 
         # 检查账号是否存在
         if cookie_manager.manager is None:
@@ -4866,7 +4872,7 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
 
         # 先获取现有设置，然后合并新设置
         current_settings = db_manager.get_ai_reply_settings(cookie_id)
-        settings_dict = settings.dict()
+        settings_dict = settings.dict(exclude_unset=True)
         
         # 合并设置：用新值覆盖旧值
         merged_settings = {**current_settings, **settings_dict}
@@ -4898,7 +4904,6 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
     try:
         # 只返回当前用户的AI回复设置
         user_id = current_user['user_id']
-        from db_manager import db_manager
         user_cookies = db_manager.get_all_cookies(user_id)
 
         all_settings = db_manager.get_all_ai_reply_settings()
@@ -4910,10 +4915,73 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
+@app.post("/ai-agent/{cookie_id}/rebuild-profile")
+def rebuild_ai_agent_profile(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """重建指定账号的风格画像"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+        return ai_reply_engine.rebuild_agent_profile(cookie_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"重建账号画像异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.get("/ai-agent/{cookie_id}/preview")
+def preview_ai_agent_reply(
+    cookie_id: str,
+    message: str,
+    item_title: str = "测试商品",
+    item_price: str = "100",
+    item_desc: str = "这是一个测试商品",
+    item_id: str = "preview_item",
+    chat_id: str = "preview_chat",
+    user_id: str = "preview_user",
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """预览 AI Agent 的样本检索与回复结果"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+        preview = ai_reply_engine.preview_reply(
+            message=message,
+            item_info={
+                'title': item_title,
+                'price': item_price,
+                'desc': item_desc,
+            },
+            cookie_id=cookie_id,
+            user_id=user_id,
+            item_id=item_id,
+            chat_id=chat_id,
+        )
+        return preview
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"预览 AI Agent 回复异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.get("/ai-agent/{cookie_id}/stats")
+def get_ai_agent_stats(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取 AI Agent 风格学习统计"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+        return ai_reply_engine.get_agent_stats(cookie_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取 AI Agent 统计异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
 @app.post("/ai-reply-test/{cookie_id}")
-def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_auth)):
+def test_ai_reply(cookie_id: str, test_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """测试AI回复功能"""
     try:
+        _ensure_cookie_access(cookie_id, current_user)
+
         # 检查账号是否存在
         if cookie_manager.manager is None:
             raise HTTPException(status_code=500, detail='CookieManager 未就绪')
@@ -4940,19 +5008,17 @@ def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_aut
             'desc': test_data.get('item_desc', '这是一个测试商品')
         }
 
-        # 生成测试回复（跳过等待时间）
-        reply = ai_reply_engine.generate_reply(
+        preview = ai_reply_engine.preview_reply(
             message=test_message,
             item_info=test_item_info,
-            chat_id=f"test_{int(time.time())}",
             cookie_id=cookie_id,
             user_id="test_user",
             item_id="test_item",
-            skip_wait=True  # 测试时跳过10秒等待
+            chat_id=f"test_{int(time.time())}",
         )
 
-        if reply:
-            return {"message": "测试成功", "reply": reply}
+        if preview.get("reply"):
+            return {"message": "测试成功", **preview}
         else:
             raise HTTPException(status_code=400, detail="AI回复生成失败，请检查API Key是否正确、API地址是否可访问")
 
@@ -6025,6 +6091,7 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
         allowed_tables = [
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', "item_replay",
             'risk_control_logs'
@@ -6063,6 +6130,7 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
         allowed_tables = [
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay'
         ]
@@ -6103,6 +6171,7 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
         allowed_tables = [
             'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', 'item_replay',
             'risk_control_logs'

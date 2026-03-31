@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Eye, EyeOff, AlertTriangle } from 'lucide-react'
-import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, updateAccountLoginInfo, type AIReplySettings } from '@/api/accounts'
+import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, updateAccountLoginInfo, previewAIReplyAgent, rebuildAIReplyProfile, getAIAgentStats, type AIReplySettings, type AISampleStats } from '@/api/accounts'
 import { getKeywords, getDefaultReply, updateDefaultReply } from '@/api/keywords'
 import { checkDefaultPassword } from '@/api/settings'
 import { useUIStore } from '@/store/uiStore'
@@ -15,6 +15,12 @@ interface AccountWithKeywordCount extends AccountDetail {
   keywordCount?: number
   aiEnabled?: boolean
 }
+
+const splitByLineOrComma = (value: string) =>
+  value
+    .split(/[\n,，]+/)
+    .map(item => item.trim())
+    .filter(Boolean)
 
 export function Accounts() {
   const { addToast } = useUIStore()
@@ -72,6 +78,29 @@ export function Accounts() {
   const [aiMaxDiscountAmount, setAiMaxDiscountAmount] = useState(100)
   const [aiMaxBargainRounds, setAiMaxBargainRounds] = useState(3)
   const [aiCustomPrompts, setAiCustomPrompts] = useState('')
+  const [aiBasePromptOverrides, setAiBasePromptOverrides] = useState('')
+  const [aiEnableStyleLearning, setAiEnableStyleLearning] = useState(false)
+  const [aiCaptureManualSamples, setAiCaptureManualSamples] = useState(true)
+  const [aiMinStyleSamples, setAiMinStyleSamples] = useState(5)
+  const [aiStyleStrength, setAiStyleStrength] = useState(0.6)
+  const [aiAllowAutoBargain, setAiAllowAutoBargain] = useState(true)
+  const [aiPreferHumanStyle, setAiPreferHumanStyle] = useState(true)
+  const [aiPromptVersion, setAiPromptVersion] = useState('v2')
+  const [aiStrategyVersion, setAiStrategyVersion] = useState('rag-v1')
+  const [aiPersonaName, setAiPersonaName] = useState('')
+  const [aiToneTags, setAiToneTags] = useState('')
+  const [aiSpeakingRules, setAiSpeakingRules] = useState('')
+  const [aiForbiddenPhrases, setAiForbiddenPhrases] = useState('')
+  const [aiSalesStyle, setAiSalesStyle] = useState('')
+  const [aiServiceStyle, setAiServiceStyle] = useState('')
+  const [aiSampleReply, setAiSampleReply] = useState('')
+  const [aiTrainingStatus, setAiTrainingStatus] = useState<Record<string, unknown>>({})
+  const [aiSampleStats, setAiSampleStats] = useState<AISampleStats | null>(null)
+  const [aiRebuildingProfile, setAiRebuildingProfile] = useState(false)
+  const [aiPreviewMessage, setAiPreviewMessage] = useState('这个还能便宜点吗？')
+  const [aiPreviewReply, setAiPreviewReply] = useState('')
+  const [aiPreviewPrompt, setAiPreviewPrompt] = useState('')
+  const [aiPreviewLoading, setAiPreviewLoading] = useState(false)
   const [aiSettingsSaving, setAiSettingsSaving] = useState(false)
   const [aiSettingsLoading, setAiSettingsLoading] = useState(false)
 
@@ -510,12 +539,35 @@ export function Accounts() {
     setActiveModal('ai-settings')
     setAiSettingsLoading(true)
     try {
-      const settings = await getAIReplySettings(account.id)
+      const [settings, stats] = await Promise.all([
+        getAIReplySettings(account.id),
+        getAIAgentStats(account.id).catch(() => null),
+      ])
       setAiEnabled(settings.ai_enabled ?? settings.enabled ?? false)
       setAiMaxDiscountPercent(settings.max_discount_percent ?? 10)
       setAiMaxDiscountAmount(settings.max_discount_amount ?? 100)
       setAiMaxBargainRounds(settings.max_bargain_rounds ?? 3)
       setAiCustomPrompts(settings.custom_prompts ?? '')
+      setAiBasePromptOverrides(settings.base_prompt_overrides ?? settings.custom_prompts ?? '')
+      setAiEnableStyleLearning(settings.enable_style_learning ?? false)
+      setAiCaptureManualSamples(settings.capture_manual_samples ?? true)
+      setAiMinStyleSamples(settings.min_style_samples ?? 5)
+      setAiStyleStrength(settings.style_strength ?? 0.6)
+      setAiAllowAutoBargain(settings.allow_auto_bargain ?? true)
+      setAiPreferHumanStyle(settings.prefer_human_style ?? true)
+      setAiPromptVersion(settings.prompt_version ?? 'v2')
+      setAiStrategyVersion(settings.strategy_version ?? 'rag-v1')
+      setAiPersonaName(settings.agent_profile?.persona_name ?? '')
+      setAiToneTags((settings.agent_profile?.tone_tags ?? []).join(', '))
+      setAiSpeakingRules((settings.agent_profile?.speaking_rules ?? []).join('\n'))
+      setAiForbiddenPhrases((settings.agent_profile?.forbidden_phrases ?? []).join(', '))
+      setAiSalesStyle(settings.agent_profile?.sales_style ?? '')
+      setAiServiceStyle(settings.agent_profile?.service_style ?? '')
+      setAiSampleReply(settings.agent_profile?.sample_reply ?? '')
+      setAiTrainingStatus(settings.training_status ?? stats?.training_status ?? {})
+      setAiSampleStats(settings.sample_stats ?? stats?.sample_stats ?? null)
+      setAiPreviewReply('')
+      setAiPreviewPrompt('')
     } catch {
       addToast({ type: 'error', message: '加载AI设置失败' })
     } finally {
@@ -533,6 +585,28 @@ export function Accounts() {
         max_discount_amount: aiMaxDiscountAmount,
         max_bargain_rounds: aiMaxBargainRounds,
         custom_prompts: aiCustomPrompts,
+        base_prompt_overrides: aiBasePromptOverrides,
+        enable_style_learning: aiEnableStyleLearning,
+        capture_manual_samples: aiCaptureManualSamples,
+        min_style_samples: aiMinStyleSamples,
+        style_strength: aiStyleStrength,
+        allow_auto_bargain: aiAllowAutoBargain,
+        prefer_human_style: aiPreferHumanStyle,
+        prompt_version: aiPromptVersion,
+        strategy_version: aiStrategyVersion,
+        agent_profile: {
+          persona_name: aiPersonaName.trim(),
+          tone_tags: splitByLineOrComma(aiToneTags),
+          speaking_rules: aiSpeakingRules
+            .split('\n')
+            .map(item => item.trim())
+            .filter(Boolean),
+          forbidden_phrases: splitByLineOrComma(aiForbiddenPhrases),
+          sales_style: aiSalesStyle.trim(),
+          service_style: aiServiceStyle.trim(),
+          sample_reply: aiSampleReply.trim(),
+        },
+        training_status: aiTrainingStatus,
       })
       // 更新本地状态
       setAccounts(prev => prev.map(a =>
@@ -544,6 +618,47 @@ export function Accounts() {
       addToast({ type: 'error', message: '保存失败' })
     } finally {
       setAiSettingsSaving(false)
+    }
+  }
+
+  const handleRebuildAIProfile = async () => {
+    if (!aiSettingsAccount) return
+    try {
+      setAiRebuildingProfile(true)
+      const result = await rebuildAIReplyProfile(aiSettingsAccount.id)
+      if (result.agent_profile) {
+        setAiPersonaName(result.agent_profile.persona_name ?? '')
+        setAiToneTags((result.agent_profile.tone_tags ?? []).join(', '))
+        setAiSpeakingRules((result.agent_profile.speaking_rules ?? []).join('\n'))
+        setAiForbiddenPhrases((result.agent_profile.forbidden_phrases ?? []).join(', '))
+        setAiSalesStyle(result.agent_profile.sales_style ?? '')
+        setAiServiceStyle(result.agent_profile.service_style ?? '')
+        setAiSampleReply(result.agent_profile.sample_reply ?? '')
+      }
+      setAiTrainingStatus(result.training_status ?? {})
+      setAiSampleStats(result.sample_stats ?? null)
+      addToast({ type: result.success ? 'success' : 'warning', message: result.message || '画像重建完成' })
+    } catch {
+      addToast({ type: 'error', message: '重建画像失败' })
+    } finally {
+      setAiRebuildingProfile(false)
+    }
+  }
+
+  const handlePreviewAIReply = async () => {
+    if (!aiSettingsAccount || !aiPreviewMessage.trim()) return
+    try {
+      setAiPreviewLoading(true)
+      const result = await previewAIReplyAgent(aiSettingsAccount.id, {
+        message: aiPreviewMessage.trim(),
+      })
+      setAiPreviewReply(result.reply ?? result.warning ?? '暂无回复')
+      setAiPreviewPrompt(result.compiled_prompt ?? '')
+      setAiSampleStats(result.sample_stats ?? null)
+    } catch {
+      addToast({ type: 'error', message: '预览失败' })
+    } finally {
+      setAiPreviewLoading(false)
     }
   }
 
@@ -1229,14 +1344,14 @@ export function Accounts() {
       {/* AI设置弹窗 */}
       {activeModal === 'ai-settings' && aiSettingsAccount && (
         <div className="modal-overlay">
-          <div className="modal-content max-w-lg">
+          <div className="modal-content max-w-3xl">
             <div className="modal-header">
               <h2 className="modal-title">AI回复设置</h2>
               <button onClick={closeModal} className="modal-close">
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="modal-body space-y-4">
+            <div className="modal-body space-y-4 max-h-[75vh] overflow-y-auto">
               {aiSettingsLoading ? (
                 <div className="flex items-center justify-center py-8">
                   <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
@@ -1252,6 +1367,81 @@ export function Accounts() {
                       className="input-ios bg-slate-100 dark:bg-slate-700"
                     />
                   </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-4">
+                    <div className="input-group">
+                      <label className="input-label text-xs">启用风格学习</label>
+                      <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
+                        <input type="checkbox" checked={aiEnableStyleLearning} onChange={(e) => setAiEnableStyleLearning(e.target.checked)} />
+                        根据人工历史学习账号风格
+                      </label>
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">采集手动回复</label>
+                      <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
+                        <input type="checkbox" checked={aiCaptureManualSamples} onChange={(e) => setAiCaptureManualSamples(e.target.checked)} />
+                        手动消息进入样本池
+                      </label>
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">优先模仿人工风格</label>
+                      <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
+                        <input type="checkbox" checked={aiPreferHumanStyle} onChange={(e) => setAiPreferHumanStyle(e.target.checked)} />
+                        回复时优先命中历史样本
+                      </label>
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">最少样本数</label>
+                      <input
+                        type="number"
+                        value={aiMinStyleSamples}
+                        onChange={(e) => setAiMinStyleSamples(Number(e.target.value))}
+                        className="input-ios"
+                        min="1"
+                        max="100"
+                      />
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">风格强度</label>
+                      <input
+                        type="number"
+                        value={aiStyleStrength}
+                        onChange={(e) => setAiStyleStrength(Number(e.target.value))}
+                        className="input-ios"
+                        min="0"
+                        max="1"
+                        step="0.1"
+                      />
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">允许自动议价</label>
+                      <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
+                        <input type="checkbox" checked={aiAllowAutoBargain} onChange={(e) => setAiAllowAutoBargain(e.target.checked)} />
+                        价格类问题可自动谈价
+                      </label>
+                    </div>
+                  </div>
+
+                  {aiSampleStats && (
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 rounded-lg bg-slate-50 dark:bg-slate-800 p-4 text-sm">
+                      <div>
+                        <div className="text-slate-500">有效样本</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">{aiSampleStats.active_samples}/{aiSampleStats.total_samples}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-500">人工接管率</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">{(aiSampleStats.human_takeover_rate * 100).toFixed(1)}%</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-500">AI轨迹数</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">{aiSampleStats.trace_count}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-500">画像状态</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">{String(aiTrainingStatus['status'] ?? aiSampleStats.last_profile_status ?? 'draft')}</div>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-2">
                     <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300 mb-3">议价设置</h3>
@@ -1291,17 +1481,120 @@ export function Accounts() {
                     </div>
                   </div>
 
+                  <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-2 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">账号画像</h3>
+                      <button type="button" onClick={handleRebuildAIProfile} className="btn-ios-secondary" disabled={aiRebuildingProfile}>
+                        {aiRebuildingProfile ? (
+                          <span className="flex items-center gap-2">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            重建中...
+                          </span>
+                        ) : (
+                          '重建画像'
+                        )}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="input-group">
+                        <label className="input-label text-xs">人设名称</label>
+                        <input value={aiPersonaName} onChange={(e) => setAiPersonaName(e.target.value)} className="input-ios" placeholder="如：爽快型二手数码卖家" />
+                      </div>
+                      <div className="input-group">
+                        <label className="input-label text-xs">语气标签</label>
+                        <input value={aiToneTags} onChange={(e) => setAiToneTags(e.target.value)} className="input-ios" placeholder="友好, 简短, 口语化" />
+                      </div>
+                      <div className="input-group">
+                        <label className="input-label text-xs">销售风格</label>
+                        <input value={aiSalesStyle} onChange={(e) => setAiSalesStyle(e.target.value)} className="input-ios" placeholder="自然成交 / 强销售" />
+                      </div>
+                      <div className="input-group">
+                        <label className="input-label text-xs">服务风格</label>
+                        <input value={aiServiceStyle} onChange={(e) => setAiServiceStyle(e.target.value)} className="input-ios" placeholder="友好耐心 / 高效率" />
+                      </div>
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">表达规则（每行一条）</label>
+                      <textarea value={aiSpeakingRules} onChange={(e) => setAiSpeakingRules(e.target.value)} className="input-ios h-24 resize-none" placeholder={'先回答当前问题\n尽量短句\n不要生硬'} />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="input-group">
+                        <label className="input-label text-xs">禁用表达</label>
+                        <input value={aiForbiddenPhrases} onChange={(e) => setAiForbiddenPhrases(e.target.value)} className="input-ios" placeholder="绝对保真, 包全新" />
+                      </div>
+                      <div className="input-group">
+                        <label className="input-label text-xs">示例回复</label>
+                        <input value={aiSampleReply} onChange={(e) => setAiSampleReply(e.target.value)} className="input-ios" placeholder="在的哈，喜欢可以直接拍" />
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="input-group">
-                    <label className="input-label">自定义提示词 (JSON格式)</label>
+                    <label className="input-label">基础提示词覆盖 (JSON格式)</label>
+                    <textarea
+                      value={aiBasePromptOverrides}
+                      onChange={(e) => setAiBasePromptOverrides(e.target.value)}
+                      className="input-ios h-28 resize-none font-mono text-xs"
+                      placeholder='{"price": "议价提示词", "tech": "技术提示词", "default": "默认提示词"}'
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="input-group">
+                      <label className="input-label text-xs">Prompt版本</label>
+                      <input value={aiPromptVersion} onChange={(e) => setAiPromptVersion(e.target.value)} className="input-ios" />
+                    </div>
+                    <div className="input-group">
+                      <label className="input-label text-xs">策略版本</label>
+                      <input value={aiStrategyVersion} onChange={(e) => setAiStrategyVersion(e.target.value)} className="input-ios" />
+                    </div>
+                  </div>
+
+                  <div className="input-group">
+                    <label className="input-label">兼容旧版自定义提示词 (JSON格式)</label>
                     <textarea
                       value={aiCustomPrompts}
                       onChange={(e) => setAiCustomPrompts(e.target.value)}
-                      className="input-ios h-32 resize-none font-mono text-xs"
-                      placeholder='{"classify": "分类提示词", "price": "议价提示词", "tech": "技术提示词", "default": "默认提示词"}'
+                      className="input-ios h-24 resize-none font-mono text-xs"
+                      placeholder='{"price": "议价提示词", "tech": "技术提示词", "default": "默认提示词"}'
                     />
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                      留空使用系统默认提示词。格式：{`{"classify": "...", "price": "...", "tech": "...", "default": "..."}`}
+                      旧字段仍会兼容保存，建议优先使用上面的“基础提示词覆盖”。
                     </p>
+                  </div>
+
+                  <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-2 space-y-3">
+                    <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">回复预览</h3>
+                    <div className="flex gap-3">
+                      <textarea
+                        value={aiPreviewMessage}
+                        onChange={(e) => setAiPreviewMessage(e.target.value)}
+                        className="input-ios h-20 resize-none flex-1"
+                        placeholder="输入一条客户消息试试看"
+                      />
+                      <button type="button" onClick={handlePreviewAIReply} className="btn-ios-primary self-start" disabled={aiPreviewLoading}>
+                        {aiPreviewLoading ? (
+                          <span className="flex items-center gap-2">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            预览中
+                          </span>
+                        ) : (
+                          '生成预览'
+                        )}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+                        <div className="text-xs text-slate-500 mb-2">预览回复</div>
+                        <div className="text-sm text-slate-800 dark:text-slate-100 whitespace-pre-wrap min-h-[60px]">{aiPreviewReply || '暂无预览结果'}</div>
+                      </div>
+                      <div className="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+                        <div className="text-xs text-slate-500 mb-2">编排后的 Prompt</div>
+                        <div className="text-xs font-mono text-slate-700 dark:text-slate-300 whitespace-pre-wrap max-h-40 overflow-y-auto">
+                          {aiPreviewPrompt || '生成预览后可查看'}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </>
               )}
