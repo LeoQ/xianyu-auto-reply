@@ -69,7 +69,7 @@ class AIReplyEngine:
             return None
         
         try:
-            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
+            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key_configured={bool(settings['api_key'])}")
             client = OpenAI(
                 api_key=settings['api_key'],
                 base_url=settings['base_url']
@@ -133,8 +133,7 @@ class AIReplyEngine:
         }
 
         logger.info(f"DashScope API请求: {url}")
-        logger.info(f"发送的prompt: {prompt[:100]}...") # 避免 prompt 过长
-        logger.debug(f"请求数据: {json.dumps(data, ensure_ascii=False)}")
+        logger.info(f"DashScope prompt长度: {len(prompt)}")
 
         response = requests.post(url, headers=headers, json=data, timeout=30)
 
@@ -143,7 +142,6 @@ class AIReplyEngine:
             raise Exception(f"DashScope API请求失败: {response.status_code} - {response.text}")
 
         result = response.json()
-        logger.debug(f"DashScope API响应: {json.dumps(result, ensure_ascii=False)}")
 
         if 'output' in result and 'text' in result['output']:
             return result['output']['text'].strip()
@@ -178,7 +176,7 @@ class AIReplyEngine:
         user_content = "\n".join(user_content_parts)
 
         if not user_content:
-            logger.warning(f"Gemini API 调用: 未在消息中找到 'user' 角色内容。Messages: {messages}")
+            logger.warning("Gemini API 调用: 未在消息中找到 'user' 角色内容")
             raise ValueError("未在消息中找到用户内容 (user content)")
         # --- 消息格式转换结束 ---
 
@@ -201,7 +199,7 @@ class AIReplyEngine:
             }
 
         logger.info(f"Calling Gemini REST API: {url.split('?')[0]}")
-        logger.debug(f"Gemini Payload: {json.dumps(payload, ensure_ascii=False)}")
+        logger.info(f"Gemini payload长度: {len(json.dumps(payload, ensure_ascii=False))}")
         
         response = requests.post(url, headers=headers, json=payload, timeout=30)
 
@@ -210,7 +208,6 @@ class AIReplyEngine:
             raise Exception(f"Gemini API 请求失败: {response.status_code} - {response.text}")
             
         result = response.json()
-        logger.debug(f"Gemini API 响应: {json.dumps(result, ensure_ascii=False)}")
 
         try:
             reply_text = result['candidates'][0]['content']['parts'][0]['text']
@@ -406,7 +403,7 @@ class AIReplyEngine:
                     client = self._create_openai_client(cookie_id)
                     if not client:
                         return None
-                    logger.info(f"messages:{messages}")
+                    logger.info(f"发送到OpenAI兼容接口的消息数: {len(messages)}")
                     reply = self._call_openai_api(client, settings, messages, max_tokens=100, temperature=0.7)
 
                 # 11. 保存AI回复到对话记录

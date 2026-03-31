@@ -192,6 +192,22 @@ class XianyuLive:
             except:
                 return "未知错误"
 
+    def _summarize_notification_config(self, config_data: dict) -> dict:
+        """输出脱敏后的通知配置摘要，避免日志泄露密钥和目标地址"""
+        sensitive_keys = {
+            'webhook_url', 'secret', 'device_key', 'bot_token', 'chat_id',
+            'email_password', 'smtp_password', 'config', 'headers'
+        }
+        summary = {}
+        for key, value in config_data.items():
+            if key in sensitive_keys:
+                summary[key] = '[redacted]'
+            elif isinstance(value, str) and len(value) > 80:
+                summary[key] = f"{value[:24]}...({len(value)} chars)"
+            else:
+                summary[key] = value
+        return summary
+
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
         if self.connection_state != new_state:
@@ -3567,12 +3583,12 @@ class XianyuLive:
                 channel_type = notification.get('channel_type')
                 channel_config = notification.get('channel_config')
 
-                logger.info(f"📱 渠道类型: {channel_type}, 配置: {channel_config}")
+                logger.info(f"📱 渠道类型: {channel_type}")
 
                 try:
                     # 解析配置数据
                     config_data = self._parse_notification_config(channel_config)
-                    logger.info(f"📱 解析后的配置数据: {config_data}")
+                    logger.info(f"📱 通知配置摘要: {self._summarize_notification_config(config_data)}")
 
                     match channel_type:
                         case 'ding_talk' | 'dingtalk':
@@ -3675,13 +3691,13 @@ class XianyuLive:
             import hashlib
             import base64
 
-            logger.info(f"📱 飞书通知 - 开始处理配置数据: {config_data}")
+            logger.info(f"📱 飞书通知 - 开始处理配置")
 
             # 解析配置
             webhook_url = config_data.get('webhook_url', '')
             secret = config_data.get('secret', '')
 
-            logger.info(f"📱 飞书通知 - Webhook URL: {webhook_url[:50]}...")
+            logger.info(f"📱 飞书通知 - Webhook已配置: {'是' if webhook_url else '否'}")
             logger.info(f"📱 飞书通知 - 是否有签名密钥: {'是' if secret else '否'}")
 
             if not webhook_url:
@@ -3720,9 +3736,8 @@ class XianyuLive:
             # 发送POST请求
             async with aiohttp.ClientSession() as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
-                    response_text = await response.text()
                     logger.info(f"📱 飞书通知 - 响应状态: {response.status}")
-                    logger.info(f"📱 飞书通知 - 响应内容: {response_text}")
+                    response_text = await response.text()
 
                     if response.status == 200:
                         try:
@@ -3734,7 +3749,7 @@ class XianyuLive:
                         except json.JSONDecodeError:
                             logger.info(f"📱 飞书通知发送成功（响应格式异常）")
                     else:
-                        logger.warning(f"📱 飞书通知发送失败: HTTP {response.status}, 响应: {response_text}")
+                        logger.warning(f"📱 飞书通知发送失败: HTTP {response.status}")
 
         except Exception as e:
             logger.error(f"📱 发送飞书通知异常: {self._safe_str(e)}")
@@ -3748,7 +3763,7 @@ class XianyuLive:
             import json
             from urllib.parse import quote
 
-            logger.info(f"📱 Bark通知 - 开始处理配置数据: {config_data}")
+            logger.info(f"📱 Bark通知 - 开始处理配置")
 
             # 解析配置
             server_url = config_data.get('server_url', 'https://api.day.app').rstrip('/')
@@ -3759,9 +3774,8 @@ class XianyuLive:
             group = config_data.get('group', 'xianyu')
             url = config_data.get('url', '')
 
-            logger.info(f"📱 Bark通知 - 服务器: {server_url}")
-            logger.info(f"📱 Bark通知 - 设备密钥: {device_key[:10]}..." if device_key else "📱 Bark通知 - 设备密钥: 未设置")
-            logger.info(f"📱 Bark通知 - 标题: {title}")
+            logger.info(f"📱 Bark通知 - 服务器已配置: {'是' if server_url else '否'}")
+            logger.info(f"📱 Bark通知 - 设备密钥已配置: {'是' if device_key else '否'}")
 
             if not device_key:
                 logger.warning("📱 Bark通知 - 设备密钥配置为空，无法发送通知")
@@ -3788,15 +3802,13 @@ class XianyuLive:
             if url:
                 data["url"] = url
 
-            logger.info(f"📱 Bark通知 - API地址: {api_url}")
             logger.info(f"📱 Bark通知 - 请求数据构建完成")
 
             # 发送POST请求
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=data, timeout=10) as response:
-                    response_text = await response.text()
                     logger.info(f"📱 Bark通知 - 响应状态: {response.status}")
-                    logger.info(f"📱 Bark通知 - 响应内容: {response_text}")
+                    response_text = await response.text()
 
                     if response.status == 200:
                         try:
@@ -3812,7 +3824,7 @@ class XianyuLive:
                             else:
                                 logger.warning(f"📱 Bark通知响应格式异常: {response_text}")
                     else:
-                        logger.warning(f"📱 Bark通知发送失败: HTTP {response.status}, 响应: {response_text}")
+                        logger.warning(f"📱 Bark通知发送失败: HTTP {response.status}")
 
         except Exception as e:
             logger.error(f"📱 发送Bark通知异常: {self._safe_str(e)}")

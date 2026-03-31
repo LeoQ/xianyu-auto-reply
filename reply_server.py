@@ -4963,8 +4963,8 @@ def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_aut
 # ==================== 日志管理API ====================
 
 @app.get("/logs")
-async def get_logs(lines: int = 200, level: str = None, source: str = None, _: None = Depends(require_auth)):
-    """获取实时系统日志"""
+async def get_logs(lines: int = 200, level: str = None, source: str = None, _: None = Depends(require_admin)):
+    """获取实时系统日志（管理员专用）"""
     try:
         # 获取文件日志收集器
         collector = get_file_log_collector()
