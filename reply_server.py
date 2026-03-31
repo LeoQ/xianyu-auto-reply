@@ -404,44 +404,26 @@ async def health_check():
 
 
 # ==================== 版本检查和更新日志接口 ====================
-import httpx
 
 @app.get('/api/version/check')
 async def check_version():
-    """检查最新版本（代理外部接口）"""
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get('https://xianyu.zhinianblog.cn/index.php?action=getVersion')
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    # 如果不是有效JSON，返回HTML内容
-                    return {"html": response.text}
-            else:
-                return {"error": True, "message": f"远程服务返回状态码: {response.status_code}"}
-    except Exception as e:
-        logger.error(f"检查版本失败: {e}")
-        return {"error": True, "message": f"检查版本失败: {str(e)}"}
+    """返回本地版本检查状态，不再代理外部服务"""
+    return {
+        "error": False,
+        "enabled": False,
+        "message": "已禁用在线版本检查，避免访问外部服务",
+    }
 
 
 @app.get('/api/version/changelog')
 async def get_changelog():
-    """获取更新日志（代理外部接口）"""
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get('https://xianyu.zhinianblog.cn/index.php?action=getUpdateInfo')
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception:
-                    # 如果不是有效JSON，返回HTML内容
-                    return {"html": response.text}
-            else:
-                return {"error": True, "message": f"远程服务返回状态码: {response.status_code}"}
-    except Exception as e:
-        logger.error(f"获取更新日志失败: {e}")
-        return {"error": True, "message": f"获取更新日志失败: {str(e)}"}
+    """返回本地更新日志状态，不再代理外部服务"""
+    return {
+        "error": False,
+        "enabled": False,
+        "message": "已禁用在线更新日志，避免访问外部服务",
+        "changelog": [],
+    }
 
 
 # 服务 React 前端 SPA - 所有前端路由都返回 index.html
