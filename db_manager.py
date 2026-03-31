@@ -11,6 +11,7 @@ import string
 import aiohttp
 import io
 import base64
+from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
@@ -55,6 +56,7 @@ class DBManager:
         logger.info(f"数据库路径: {self.db_path}")
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
+        self._cookie_password_cipher = None
 
         # SQL日志配置 - 默认启用
         self.sql_log_enabled = True  # 默认启用SQL日志
@@ -483,6 +485,7 @@ class DBManager:
 
             # 执行数据库迁移
             self._migrate_database(cursor)
+            self._migrate_legacy_cookie_passwords(cursor)
 
             self.conn.commit()
             logger.info("数据库初始化完成")
@@ -525,6 +528,70 @@ class DBManager:
             logger.error(f"数据库迁移失败: {e}")
             # 迁移失败不应该阻止程序启动
             pass
+
+    def _get_cookie_password_key_path(self) -> str:
+        password_dir = os.path.dirname(self.db_path) or '.'
+        return os.path.join(password_dir, 'cookie_password.key')
+
+    def _get_cookie_password_cipher(self) -> Fernet:
+        if self._cookie_password_cipher is not None:
+            return self._cookie_password_cipher
+
+        key_from_env = os.getenv('XIANYU_COOKIE_PASSWORD_KEY')
+        if key_from_env:
+            key = key_from_env.encode('utf-8')
+        else:
+            key_path = self._get_cookie_password_key_path()
+            if os.path.exists(key_path):
+                with open(key_path, 'rb') as file:
+                    key = file.read().strip()
+            else:
+                key = Fernet.generate_key()
+                with open(key_path, 'wb') as file:
+                    file.write(key)
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+
+        self._cookie_password_cipher = Fernet(key)
+        return self._cookie_password_cipher
+
+    def _encrypt_cookie_password(self, password: str) -> str:
+        if not password:
+            return ''
+        token = self._get_cookie_password_cipher().encrypt(password.encode('utf-8')).decode('utf-8')
+        return f"enc${token}"
+
+    def _decrypt_cookie_password(self, stored_password: str) -> str:
+        if not stored_password:
+            return ''
+        if not stored_password.startswith('enc$'):
+            return stored_password
+        try:
+            token = stored_password[4:].encode('utf-8')
+            return self._get_cookie_password_cipher().decrypt(token).decode('utf-8')
+        except (InvalidToken, ValueError) as e:
+            logger.error(f"解密账号密码失败: {e}")
+            return ''
+
+    def _migrate_legacy_cookie_passwords(self, cursor):
+        """将历史明文账号密码加密后再存储"""
+        try:
+            cursor.execute("SELECT id, password FROM cookies WHERE password IS NOT NULL AND password != ''")
+            rows = cursor.fetchall()
+            migrated_count = 0
+
+            for cookie_id, stored_password in rows:
+                if stored_password and not stored_password.startswith('enc$'):
+                    encrypted_password = self._encrypt_cookie_password(stored_password)
+                    cursor.execute("UPDATE cookies SET password = ? WHERE id = ?", (encrypted_password, cookie_id))
+                    migrated_count += 1
+
+            if migrated_count:
+                logger.info(f"已加密迁移 {migrated_count} 条账号登录密码")
+        except Exception as e:
+            logger.error(f"迁移历史账号密码失败: {e}")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image类型"""
@@ -1332,15 +1399,15 @@ class DBManager:
                 logger.error(f"根据ID获取Cookie失败: {e}")
                 return None
 
-    def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
-        """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password和show_browser"""
+    def get_cookie_details(self, cookie_id: str, include_sensitive: bool = False) -> Optional[Dict[str, any]]:
+        """获取Cookie的详细信息，敏感字段默认不返回"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
-                    return {
+                    details = {
                         'id': result[0],
                         'value': result[1],
                         'user_id': result[2],
@@ -1348,10 +1415,12 @@ class DBManager:
                         'remark': result[4] or '',
                         'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[6] or '',
-                        'password': result[7] or '',
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'created_at': result[9]
                     }
+                    if include_sensitive:
+                        details['password'] = self._decrypt_cookie_password(result[7] or '')
+                    return details
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
@@ -1419,7 +1488,7 @@ class DBManager:
                 return 10
 
     def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
-        """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
+        """更新Cookie的账号信息（包括cookie值、用户名、加密后的密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
         """
         with self.lock:
@@ -1454,8 +1523,9 @@ class DBManager:
                         insert_placeholders.append('?')
                     
                     if password is not None:
+                        encrypted_password = self._encrypt_cookie_password(password) if password else ''
                         insert_fields.append('password')
-                        insert_values.append(password)
+                        insert_values.append(encrypted_password)
                         insert_placeholders.append('?')
                     
                     if show_browser is not None:
@@ -1483,8 +1553,9 @@ class DBManager:
                         params.append(username)
                     
                     if password is not None:
+                        encrypted_password = self._encrypt_cookie_password(password) if password else ''
                         update_fields.append("password = ?")
-                        params.append(password)
+                        params.append(encrypted_password)
                     
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")

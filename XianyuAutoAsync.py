@@ -2089,7 +2089,7 @@ class XianyuLive:
         try:
             # 从数据库获取账号登录信息
             from db_manager import db_manager
-            account_info = db_manager.get_cookie_details(self.cookie_id)
+            account_info = db_manager.get_cookie_details(self.cookie_id, include_sensitive=True)
             
             if not account_info:
                 logger.error(f"【{self.cookie_id}】无法获取账号信息")

@@ -25,7 +25,6 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     remark?: string
     pause_duration?: number
     username?: string
-    login_password?: string
     show_browser?: boolean
   }
   const data = await get<BackendAccountDetail[]>('/cookies/details')
@@ -38,7 +37,6 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     note: item.remark,
     pause_duration: item.pause_duration,
     username: item.username,
-    login_password: item.login_password,
     show_browser: item.show_browser,
     use_ai_reply: false,
     use_default_reply: false,

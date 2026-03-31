@@ -53,7 +53,7 @@ qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
 
 # 账号密码登录会话管理
-password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
+password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
@@ -1371,7 +1371,6 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
             'username': cookie_details.get('username', '') if cookie_details else '',
-            'login_password': cookie_details.get('password', '') if cookie_details else '',
             'show_browser': cookie_details.get('show_browser', False) if cookie_details else False
         })
     return result
@@ -1765,7 +1764,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     account_id,
                     cookie_value=cookies_str,
                     username=account,
-                    password=password,
                     show_browser=show_browser,
                     user_id=user_id  # 新账号时需要提供user_id
                 )
@@ -1941,7 +1939,6 @@ async def password_login(
         password_login_sessions[session_id] = {
             'account_id': account_id,
             'account': account,
-            'password': password,
             'show_browser': show_browser,
             'status': 'processing',
             'verification_url': None,

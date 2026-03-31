@@ -359,7 +359,7 @@ export function Accounts() {
     setEditAutoConfirm(account.auto_confirm || false)
     setEditPauseDuration(account.pause_duration || 0)
     setEditUsername(account.username || '')
-    setEditLoginPassword(account.login_password || '')
+    setEditLoginPassword('')
     setEditShowBrowser(account.show_browser || false)
     setShowLoginPassword(false)
     setActiveModal('edit')
@@ -395,15 +395,16 @@ export function Accounts() {
       }
 
       // 更新登录信息
+      const loginPasswordChanged = editLoginPassword.trim() !== ''
       const loginInfoChanged = 
         editUsername !== (editingAccount.username || '') ||
-        editLoginPassword !== (editingAccount.login_password || '') ||
+        loginPasswordChanged ||
         editShowBrowser !== (editingAccount.show_browser || false)
       
       if (loginInfoChanged) {
         promises.push(updateAccountLoginInfo(editingAccount.id, {
           username: editUsername,
-          login_password: editLoginPassword,
+          ...(loginPasswordChanged ? { login_password: editLoginPassword } : {}),
           show_browser: editShowBrowser,
         }))
       }
@@ -1049,7 +1050,7 @@ export function Accounts() {
                           value={editLoginPassword}
                           onChange={(e) => setEditLoginPassword(e.target.value)}
                           className="input-ios pr-10"
-                          placeholder="登录密码"
+                          placeholder="留空表示不修改"
                         />
                         <button
                           type="button"
@@ -1081,7 +1082,7 @@ export function Accounts() {
                     </div>
                   </div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
-                    保存登录信息后，Cookie过期时系统可自动重新登录
+                    登录密码仅在更新时写入加密存储，不会再回显到页面
                   </p>
                 </div>
 

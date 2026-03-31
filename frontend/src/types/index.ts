@@ -40,7 +40,6 @@ export interface AccountDetail extends Account {
   keywords?: Keyword[]
   keywordCount?: number
   username?: string
-  login_password?: string
   show_browser?: boolean
 }
 
