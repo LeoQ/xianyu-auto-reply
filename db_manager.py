@@ -2,9 +2,11 @@ import sqlite3
 import os
 import threading
 import hashlib
+import hmac
 import time
 import json
 import random
+import secrets
 import string
 import aiohttp
 import io
@@ -12,6 +14,10 @@ import base64
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
+
+PBKDF2_ALGORITHM = 'sha256'
+PBKDF2_ITERATIONS = 390000
+PBKDF2_SALT_BYTES = 16
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
@@ -461,6 +467,7 @@ class DBManager:
             ('registration_enabled', 'true', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '登录滑动验证码开关'),
+            ('admin_password_rotation_required', 'false', '管理员是否需要修改初始化密码'),
             ('smtp_server', '', 'SMTP服务器地址'),
             ('smtp_port', '587', 'SMTP端口'),
             ('smtp_user', '', 'SMTP登录用户名（发件邮箱）'),
@@ -653,13 +660,32 @@ class DBManager:
             admin_exists = cursor.fetchone()[0] > 0
 
             if not admin_exists:
-                # 首次创建admin用户，设置默认密码
-                default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+                initial_password = os.getenv('XIANYU_INITIAL_ADMIN_PASSWORD') or os.getenv('INITIAL_ADMIN_PASSWORD')
+                password_from_env = bool(initial_password)
+
+                if not initial_password:
+                    initial_password = secrets.token_urlsafe(18)
+
+                default_password_hash = self._hash_password(initial_password)
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash) VALUES
                 ('admin', 'admin@localhost', ?)
                 ''', (default_password_hash,))
-                logger.info("创建默认admin用户，密码: admin123")
+
+                cursor.execute('''
+                INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (
+                    'admin_password_rotation_required',
+                    'false' if password_from_env else 'true',
+                    '管理员是否需要修改初始化密码'
+                ))
+
+                if password_from_env:
+                    logger.warning("创建默认admin用户，初始密码来自环境变量 XIANYU_INITIAL_ADMIN_PASSWORD")
+                else:
+                    password_file = self._write_initial_admin_password(initial_password)
+                    logger.warning(f"创建默认admin用户，随机初始密码已写入: {password_file}")
 
             # 获取admin用户ID，用于历史数据绑定
             self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
@@ -2599,12 +2625,106 @@ class DBManager:
 
     # ==================== 用户管理方法 ====================
 
+    def _hash_password(self, password: str) -> str:
+        """使用带盐 PBKDF2 生成密码哈希"""
+        salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
+        digest = hashlib.pbkdf2_hmac(
+            PBKDF2_ALGORITHM,
+            password.encode('utf-8'),
+            salt,
+            PBKDF2_ITERATIONS
+        )
+        return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+    def _verify_password_hash(self, password: str, stored_hash: str) -> Tuple[bool, bool]:
+        """验证密码哈希，返回 (是否匹配, 是否需要升级旧哈希)"""
+        if not stored_hash:
+            return False, False
+
+        if stored_hash.startswith('pbkdf2_sha256$'):
+            try:
+                _, iteration_str, salt_hex, digest_hex = stored_hash.split('$', 3)
+                iterations = int(iteration_str)
+                expected = hashlib.pbkdf2_hmac(
+                    PBKDF2_ALGORITHM,
+                    password.encode('utf-8'),
+                    bytes.fromhex(salt_hex),
+                    iterations
+                ).hex()
+                return hmac.compare_digest(expected, digest_hex), False
+            except Exception as e:
+                logger.error(f"验证PBKDF2密码失败: {e}")
+                return False, False
+
+        legacy_digest = hashlib.sha256(password.encode('utf-8')).hexdigest()
+        if hmac.compare_digest(stored_hash, legacy_digest):
+            return True, True
+
+        return False, False
+
+    def _store_user_password_hash(self, username: str, password_hash: str, clear_admin_rotation_required: bool = False) -> bool:
+        """直接写入密码哈希"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE username = ?
+                ''', (password_hash, username))
+
+                if cursor.rowcount <= 0:
+                    logger.warning(f"用户 {username} 不存在，密码更新失败")
+                    self.conn.rollback()
+                    return False
+
+                if username == 'admin' and clear_admin_rotation_required:
+                    cursor.execute('''
+                    INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (
+                        'admin_password_rotation_required',
+                        'false',
+                        '管理员是否需要修改初始化密码'
+                    ))
+
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"写入用户密码哈希失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def _write_initial_admin_password(self, password: str) -> str:
+        """将随机生成的管理员初始密码写入本地文件"""
+        password_dir = os.path.dirname(self.db_path) or '.'
+        password_file = os.path.join(password_dir, 'initial_admin_password.txt')
+        content = (
+            "闲鱼自动回复系统管理员初始化信息\n"
+            "username=admin\n"
+            f"password={password}\n"
+            "请在首次登录后立即修改密码。\n"
+        )
+
+        with open(password_file, 'w', encoding='utf-8') as file:
+            file.write(content)
+
+        try:
+            os.chmod(password_file, 0o600)
+        except OSError:
+            pass
+
+        return password_file
+
+    def is_admin_password_rotation_required(self) -> bool:
+        """检查管理员是否仍需修改初始化密码"""
+        return (self.get_system_setting('admin_password_rotation_required') or 'false').lower() == 'true'
+
     def create_user(self, username: str, email: str, password: str) -> bool:
         """创建新用户"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                password_hash = self._hash_password(password)
 
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash)
@@ -2675,39 +2795,34 @@ class DBManager:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
 
-    def verify_user_password(self, username: str, password: str) -> bool:
+    def verify_user_password(self, username: str, password: str, upgrade_legacy: bool = True) -> bool:
         """验证用户密码"""
         user = self.get_user_by_username(username)
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return user['password_hash'] == password_hash and user['is_active']
+        verified, needs_upgrade = self._verify_password_hash(password, user['password_hash'])
+        if not verified or not user['is_active']:
+            return False
+
+        if needs_upgrade and upgrade_legacy:
+            upgraded = self._store_user_password_hash(username, self._hash_password(password))
+            if upgraded:
+                logger.info(f"用户 {username} 的旧版SHA-256密码已自动升级为PBKDF2")
+
+        return True
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
-
-                cursor.execute('''
-                UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE username = ?
-                ''', (password_hash, username))
-
-                if cursor.rowcount > 0:
-                    self.conn.commit()
-                    logger.info(f"用户 {username} 密码更新成功")
-                    return True
-                else:
-                    logger.warning(f"用户 {username} 不存在，密码更新失败")
-                    return False
-
-            except Exception as e:
-                logger.error(f"更新用户密码失败: {e}")
-                self.conn.rollback()
-                return False
+        password_hash = self._hash_password(new_password)
+        success = self._store_user_password_hash(
+            username,
+            password_hash,
+            clear_admin_rotation_required=(username == 'admin')
+        )
+        if success:
+            logger.info(f"用户 {username} 密码更新成功")
+        return success
 
     def generate_verification_code(self) -> str:
         """生成6位数字验证码"""

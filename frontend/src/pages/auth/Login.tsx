@@ -168,8 +168,6 @@ export function Login() {
     }
   }
 
-  const fillDefaultCredentials = () => { setLoginType('username'); setUsername('admin'); setPassword('admin123') }
-
   return (
     <div className="min-h-screen flex bg-slate-50 dark:bg-slate-900 transition-colors duration-200">
       <button onClick={toggleTheme} className="fixed top-4 right-4 z-50 p-2.5 rounded-lg bg-white dark:bg-slate-800 shadow-sm border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors duration-150" title={isDark ? '切换到亮色模式' : '切换到暗色模式'}>
@@ -221,7 +219,17 @@ export function Login() {
               <button type="submit" disabled={loading} className="w-full btn-ios-primary">{loading ? <ButtonLoading /> : '登 录'}</button>
             </form>
             {registrationEnabled && (<p className="text-center mt-6 text-slate-500 dark:text-slate-400 text-sm">还没有账号？{' '}<Link to="/register" className="text-blue-600 dark:text-blue-400 font-medium hover:text-blue-700 dark:hover:text-blue-300">立即注册</Link></p>)}
-            {showDefaultLogin && (<div className="mt-6 pt-6 border-t border-slate-100 dark:border-slate-700"><button type="button" onClick={fillDefaultCredentials} className="w-full flex items-center justify-between p-3 rounded-md bg-slate-50 dark:bg-slate-700/50 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors text-sm"><div className="text-left"><p className="text-slate-500 dark:text-slate-400">演示账号</p><p className="text-slate-900 dark:text-white font-medium">admin / admin123</p></div><span className="text-blue-600 dark:text-blue-400">一键填充 →</span></button></div>)}
+            {showDefaultLogin && (
+              <div className="mt-6 pt-6 border-t border-slate-100 dark:border-slate-700">
+                <div className="rounded-md bg-slate-50 dark:bg-slate-700/50 p-3 text-sm">
+                  <p className="text-slate-500 dark:text-slate-400">初始化管理员账号</p>
+                  <p className="text-slate-900 dark:text-white font-medium">用户名: admin</p>
+                  <p className="mt-1 text-slate-500 dark:text-slate-400">
+                    初始密码为部署时设置的环境变量，或保存在服务器本地的 <code>data/initial_admin_password.txt</code>。
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
         </motion.div>
       </div>

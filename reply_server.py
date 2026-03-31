@@ -41,7 +41,7 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
+LEGACY_DEFAULT_ADMIN_PASSWORD = "admin123"  # 仅用于检测历史弱口令
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
 
@@ -710,9 +710,12 @@ async def check_default_password(current_user: Dict[str, Any] = Depends(get_curr
             logger.info(f"非admin用户，跳过检查")
             return {"using_default": False}
 
-        # 检查是否使用默认密码
-        using_default = db_manager.verify_user_password('admin', DEFAULT_ADMIN_PASSWORD)
-        logger.info(f"默认密码检查结果: {using_default}, DEFAULT_ADMIN_PASSWORD={DEFAULT_ADMIN_PASSWORD}")
+        # 历史安装可能仍在使用 admin123，新安装则通过系统标记要求修改初始化密码
+        using_default = (
+            db_manager.is_admin_password_rotation_required()
+            or db_manager.verify_user_password('admin', LEGACY_DEFAULT_ADMIN_PASSWORD, upgrade_legacy=False)
+        )
+        logger.info(f"默认密码检查结果: {using_default}")
         
         return {"using_default": using_default}
 
