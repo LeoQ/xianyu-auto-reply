@@ -18,6 +18,7 @@ const tableOptions = [
   { value: 'reply_style_samples', label: '风格样本表' },
   { value: 'agent_profiles', label: '账号画像表' },
   { value: 'reply_generation_traces', label: 'AI轨迹表' },
+  { value: 'account_bootstrap_jobs', label: '账号初始化任务表' },
   { value: 'notification_channels', label: '通知渠道表' },
   { value: 'delivery_rules', label: '发货规则表' },
   { value: 'risk_control_logs', label: '风控日志表' },

@@ -21,6 +21,7 @@ from config import (
 import sys
 import aiohttp
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from db_manager import db_manager
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
@@ -753,6 +754,12 @@ class XianyuLive:
         self.processed_message_ids_lock = asyncio.Lock()  # 消息ID去重的锁
         self.processed_message_ids_max_size = 10000  # 最大保存10000个消息ID，防止内存泄漏
         self.message_expire_time = 3600  # 消息过期时间（秒），默认1小时后可以重复回复
+
+        # 会话读状态同步：当前基于第二条 IM WebSocket 的方案会影响主连接稳定性，默认关闭
+        self.last_conversation_read_sync_time = {}  # {chat_id: timestamp}
+        self.conversation_read_sync_lock = asyncio.Lock()
+        self.conversation_read_sync_cooldown = 3  # 同一会话3秒内最多同步一次，避免高频消息造成额外压力
+        self.enable_conversation_read_sync = False
 
         # 初始化订单状态处理器
         self._init_order_status_handler()
@@ -3486,6 +3493,10 @@ class XianyuLive:
                 skip_wait=True  # 跳过内部等待，因为外部已实现防抖
             )
 
+            if reply == "EMPTY_REPLY":
+                logger.info(f"【{self.cookie_id}】AI判定当前问题与商品/会话无关，跳过自动回复")
+                return "EMPTY_REPLY"
+
             if reply:
                 logger.info(f"【{self.cookie_id}】AI回复生成成功: {reply}")
                 return reply
@@ -5092,8 +5103,13 @@ class XianyuLive:
                             break
                         else:
                             # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
-                            if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):
-                                logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试")
+                            refresh_status = getattr(self, 'last_token_refresh_status', None)
+                            if refresh_status in ("skipped_cooldown", "restarted_after_cookie_refresh"):
+                                logger.info(
+                                    f"【{self.cookie_id}】Token刷新未执行或已重启（正常），保留当前Token并继续运行"
+                                )
+                                await self._interruptible_sleep(60)
+                                continue
                             else:
                                 logger.error(f"【{self.cookie_id}】Token刷新失败，将在{self.token_retry_interval // 60}分钟后重试")
 
@@ -5194,10 +5210,16 @@ class XianyuLive:
         }
         await ws.send(json.dumps(msg))
 
-    async def init(self, ws):
+    async def init(self, ws, refresh_token_if_due: bool = True):
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
-        if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
+        should_refresh = (
+            not self.current_token or (
+                refresh_token_if_due and
+                (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval
+            )
+        )
+        if should_refresh:
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
 
@@ -5247,6 +5269,330 @@ class XianyuLive:
         }
         await ws.send(json.dumps(msg))
         logger.info(f'【{self.cookie_id}】连接注册完成')
+
+    def _build_im_websocket_headers(self) -> dict:
+        """构建 IM WebSocket 连接头"""
+        return {
+            "Cookie": self.cookies_str,
+            "Host": "wss-goofish.dingtalk.com",
+            "Connection": "Upgrade",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Origin": "https://www.goofish.com",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+
+    @asynccontextmanager
+    async def open_im_rpc_socket(self):
+        """打开一个短生命周期的 IM RPC 连接，用于历史同步等主动查询场景"""
+        connection = await self._create_websocket_connection(self._build_im_websocket_headers())
+        async with connection as websocket:
+            # 短连接优先复用当前 token，避免因消息冷却触发不必要的 token 刷新
+            await self.init(websocket, refresh_token_if_due=False)
+            yield websocket
+
+    async def _send_im_request(self, websocket, lwp: str, body=None, timeout: float = 20.0):
+        """在短连接上发送一条 IM RPC 请求并等待对应响应"""
+        request_mid = generate_mid()
+        payload = {
+            "lwp": lwp,
+            "headers": {
+                "mid": request_mid,
+            },
+        }
+        if body is not None:
+            payload["body"] = body
+
+        await websocket.send(json.dumps(payload))
+        deadline = time.monotonic() + timeout
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(f"IM 请求超时: {lwp}")
+
+            raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            message_data = json.loads(raw_message)
+
+            if message_data.get("lwp") == "/s/sync":
+                try:
+                    ack = {
+                        "code": 200,
+                        "headers": message_data.get("headers", {}),
+                    }
+                    await websocket.send(json.dumps(ack))
+                except Exception:
+                    pass
+                continue
+
+            headers = message_data.get("headers") or {}
+            if headers.get("mid") == request_mid:
+                code = message_data.get("code")
+                if code not in (None, 200):
+                    raise RuntimeError(f"IM 请求失败: {lwp}, code={code}, body={message_data.get('body')}")
+                return message_data
+
+    def _extract_history_text(self, payload: dict) -> str:
+        """尽量从历史消息结构中提取纯文本内容"""
+        if not isinstance(payload, dict):
+            return ''
+
+        content = payload.get('content') or {}
+        custom = content.get('custom') or {}
+        custom_data = custom.get('data')
+        if isinstance(custom_data, str):
+            try:
+                decoded = base64.b64decode(custom_data).decode('utf-8')
+                parsed = json.loads(decoded)
+                if isinstance(parsed, dict):
+                    text_payload = parsed.get('text') or {}
+                    if isinstance(text_payload, dict):
+                        text = text_payload.get('text')
+                        if isinstance(text, str):
+                            return text.strip()
+                    if isinstance(parsed.get('content'), str):
+                        return parsed.get('content', '').strip()
+            except Exception:
+                pass
+
+        searchable = payload.get('searchableContent') or {}
+        summary = searchable.get('summary')
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+
+        extension = payload.get('extension') or {}
+        for key in ('reminderContent', 'detailNotice', 'reminderNotice'):
+            value = extension.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return ''
+
+    def _should_ignore_history_message(self, text: str, payload: dict = None) -> bool:
+        """过滤系统卡片/提示/非真实对话消息"""
+        normalized = (text or '').strip()
+        if not normalized:
+            return True
+
+        content_type = None
+        if isinstance(payload, dict):
+            content = payload.get('content') or {}
+            content_type = content.get('contentType')
+
+        if content_type not in (None, 101):
+            return True
+
+        blocked_fragments = [
+            '设置不砍价回复',
+            '去创建合约',
+            'AI正在帮你回复消息',
+            '发来一条新消息',
+            '发来一条消息',
+            '快给ta一个评价吧',
+            '卖家人不错？送Ta闲鱼小红花',
+        ]
+        if any(fragment in normalized for fragment in blocked_fragments):
+            return True
+
+        if normalized.startswith('[') and normalized.endswith(']'):
+            return True
+
+        try:
+            from ai_reply_engine import ai_reply_engine
+            if ai_reply_engine.should_ignore_auto_reply_message(normalized):
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _normalize_history_message(self, chat_id: str, item_id: str, payload: dict) -> dict:
+        """将 IM 历史消息统一整理为本地结构"""
+        if not isinstance(payload, dict):
+            return {}
+
+        text = self._extract_history_text(payload)
+        if self._should_ignore_history_message(text, payload):
+            return {}
+
+        sender = payload.get('sender') or {}
+        extension = payload.get('extension') or {}
+        sender_id = str(sender.get('uid') or extension.get('senderUserId') or '')
+        if not sender_id:
+            return {}
+
+        message_id = payload.get('messageId')
+        create_at = payload.get('createAt')
+        create_time = None
+        if isinstance(create_at, (int, float)) and create_at > 0:
+            create_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(create_at / 1000))
+
+        return {
+            'chat_id': chat_id,
+            'item_id': item_id,
+            'sender_id': sender_id,
+            'sender_role': 'seller' if sender_id == str(self.myid) else 'buyer',
+            'content': text,
+            'message_type': 'text',
+            'source_message_id': str(message_id) if message_id is not None else None,
+            'source_chat_id': str(payload.get('cid') or chat_id),
+            'source_event_time': create_time,
+            'is_manual': sender_id == str(self.myid),
+            'reply_source': 'history_manual' if sender_id == str(self.myid) else 'history_incoming',
+            'metadata': {
+                'contentType': (payload.get('content') or {}).get('contentType'),
+                'raw_extension': extension,
+            },
+        }
+
+    def _extract_conversation_item_id(self, conversation: dict) -> str:
+        single = (conversation or {}).get('singleChatUserConversation') or {}
+        single_chat = single.get('singleChatConversation') or {}
+        extension = single_chat.get('extension') or {}
+        return str(extension.get('itemId') or '')
+
+    async def list_recent_conversations(self, limit: int = 200, cursor: int = None, websocket=None) -> list:
+        """拉取最近活跃会话列表"""
+        async def _run(ws):
+            conversations = []
+            next_cursor = int(cursor or time.time() * 1000)
+            remaining = max(int(limit or 0), 0)
+
+            while remaining > 0:
+                batch_limit = min(remaining, 50)
+                response = await self._send_im_request(
+                    ws,
+                    "/r/Conversation/listNewestPagination",
+                    [next_cursor, batch_limit],
+                    timeout=25.0,
+                )
+                body = response.get('body') or {}
+                batch = body.get('userConvs') or []
+                if not isinstance(batch, list) or not batch:
+                    break
+
+                conversations.extend(batch)
+                remaining = max(limit - len(conversations), 0)
+                has_more = int(body.get('hasMore') or 0)
+                next_cursor = body.get('nextCursor') or 0
+                if not has_more or not next_cursor:
+                    break
+
+            return conversations[:limit]
+
+        if websocket is not None:
+            return await _run(websocket)
+
+        async with self.open_im_rpc_socket() as ws:
+            return await _run(ws)
+
+    async def fetch_conversation_messages(self, chat_id: str, item_id: str = None, limit: int = 100,
+                                          cursor: str = None, websocket=None) -> dict:
+        """尽力拉取单会话历史消息；若详细接口不可用，返回空列表供上层决定是否退化为 lastMessage"""
+        candidate_requests = [
+            ("/r/Message/listPagination", [{"conversationId": f"{chat_id}@goofish", "pageSize": limit, "lastMessageId": cursor or ""}]),
+            ("/r/Message/listPagination", [f"{chat_id}@goofish", limit, cursor or ""]),
+            ("/r/Message/list", [{"conversationId": f"{chat_id}@goofish", "pageSize": limit, "lastMessageId": cursor or ""}]),
+            ("/r/Message/queryPagination", [{"conversationId": f"{chat_id}@goofish", "pageSize": limit, "lastMessageId": cursor or ""}]),
+        ]
+
+        def _extract_records(body):
+            if isinstance(body, dict):
+                for key in ('messages', 'messageList', 'list', 'items', 'data'):
+                    value = body.get(key)
+                    if isinstance(value, list) and value:
+                        return value
+                    if isinstance(value, dict):
+                        nested = _extract_records(value)
+                        if nested:
+                            return nested
+            elif isinstance(body, list):
+                for item in body:
+                    if isinstance(item, dict):
+                        nested = _extract_records(item)
+                        if nested:
+                            return nested
+            return []
+
+        async def _run(ws):
+            last_error = None
+            for lwp, body in candidate_requests:
+                try:
+                    response = await self._send_im_request(ws, lwp, body, timeout=15.0)
+                    raw_messages = _extract_records(response.get('body'))
+                    normalized_messages = []
+                    for raw_message in raw_messages:
+                        normalized = self._normalize_history_message(chat_id, item_id, raw_message)
+                        if normalized:
+                            normalized_messages.append(normalized)
+                    if normalized_messages:
+                        return {
+                            'messages': normalized_messages,
+                            'next_cursor': None,
+                            'has_more': False,
+                            'source': lwp,
+                            'partial': False,
+                        }
+                except Exception as error:
+                    last_error = error
+
+            if last_error:
+                logger.warning(f"【{self.cookie_id}】拉取会话 {chat_id} 详细历史失败: {self._safe_str(last_error)}")
+            return {
+                'messages': [],
+                'next_cursor': None,
+                'has_more': False,
+                'source': None,
+                'partial': True,
+                'error': self._safe_str(last_error) if last_error else '',
+            }
+
+        if websocket is not None:
+            return await _run(websocket)
+
+        async with self.open_im_rpc_socket() as ws:
+            return await _run(ws)
+
+    async def sync_conversation_read_state(self, chat_id: str, item_id: str = None, limit: int = 20) -> bool:
+        """主动读取会话消息，尽量触发闲鱼侧已读状态同步"""
+        if not self.enable_conversation_read_sync:
+            logger.debug(f"【{self.cookie_id}】会话读状态同步当前已关闭，跳过 chat_id={chat_id}")
+            return False
+
+        normalized_chat_id = str(chat_id or '').strip()
+        if not normalized_chat_id:
+            return False
+
+        now = time.time()
+        async with self.conversation_read_sync_lock:
+            last_sync_time = self.last_conversation_read_sync_time.get(normalized_chat_id, 0)
+            if now - last_sync_time < self.conversation_read_sync_cooldown:
+                logger.debug(
+                    f"【{self.cookie_id}】会话 {normalized_chat_id} 已在冷却期内，跳过重复读状态同步"
+                )
+                return False
+            self.last_conversation_read_sync_time[normalized_chat_id] = now
+
+        try:
+            result = await self.fetch_conversation_messages(
+                chat_id=normalized_chat_id,
+                item_id=item_id,
+                limit=max(1, min(int(limit or 20), 50)),
+            )
+            read_count = len((result or {}).get('messages') or [])
+            logger.info(
+                f"【{self.cookie_id}】会话 {normalized_chat_id} 已主动读取 {read_count} 条消息，尝试同步为已读状态"
+            )
+            return True
+        except Exception as e:
+            async with self.conversation_read_sync_lock:
+                self.last_conversation_read_sync_time.pop(normalized_chat_id, None)
+            logger.warning(
+                f"【{self.cookie_id}】会话 {normalized_chat_id} 读状态同步失败: {self._safe_str(e)}"
+            )
+            return False
 
     async def send_heartbeat(self, ws):
         """发送心跳包"""
@@ -7178,6 +7524,9 @@ class XianyuLive:
                 else:
                     # 2. 关键词匹配失败，如果AI开关打开，尝试AI回复
                     reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    if reply == "EMPTY_REPLY":
+                        logger.info(f"[{msg_time}] 【{self.cookie_id}】AI判定为无关问题，跳过自动回复")
+                        return
                     if reply:
                         reply_source = 'AI'  # 标记为AI回复
                     else:
@@ -7943,7 +8292,8 @@ class XianyuLive:
 
                         try:
                             # 开始初始化
-                            await self.init(websocket)
+                            # 主连接重连时优先复用当前 token，避免收到消息后的冷却期触发强制刷新
+                            await self.init(websocket, refresh_token_if_due=False)
                             logger.info(f"【{self.cookie_id}】WebSocket初始化完成！")
 
                             # 初始化完成后才设置为已连接状态

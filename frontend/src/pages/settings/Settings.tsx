@@ -378,11 +378,11 @@ export function Settings() {
                 <label className="input-label">API 地址</label>
                 <input
                   type="text"
-                  value={settings?.ai_api_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1'}
+                  value={settings?.ai_api_url || 'https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1'}
                   onChange={(e) => setSettings(s => s ? { ...s, ai_api_url: e.target.value } : null)}
                   className="input-ios"
                 />
-                <p className="text-xs text-slate-400 mt-1">无需补全 /chat/completions</p>
+                <p className="text-xs text-slate-400 mt-1">Responses API 兼容地址，无需补全 /responses</p>
               </div>
               <div className="input-group">
                 <label className="input-label">API Key</label>
@@ -423,11 +423,11 @@ export function Settings() {
                 <label className="input-label">模型</label>
                 <input
                   type="text"
-                  value={settings?.ai_model || 'qwen-plus'}
+                  value={settings?.ai_model || 'qwen3.5-plus'}
                   onChange={(e) => setSettings(s => s ? { ...s, ai_model: e.target.value } : null)}
                   className="input-ios"
                 />
-                <p className="text-xs text-slate-400 mt-1">如: qwen-plus、qwen-turbo、gpt-3.5-turbo、gpt-4</p>
+                <p className="text-xs text-slate-400 mt-1">如: qwen3.5-plus、qwen-plus、qwen-turbo、gpt-4；当前 Responses API 推荐 qwen3.5-plus</p>
               </div>
               <div className="flex items-end gap-2">
                 <div className="flex-1">
@@ -450,7 +450,7 @@ export function Settings() {
               <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3 text-xs text-slate-500 dark:text-slate-400">
                 <p className="font-medium mb-1">常见 AI 服务配置:</p>
                 <ul className="space-y-0.5 list-disc list-inside">
-                  <li>阿里云通义千问: https://dashscope.aliyuncs.com/compatible-mode/v1</li>
+                  <li>阿里云通义千问 Responses API: https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1</li>
                   <li>OpenAI: https://api.openai.com/v1</li>
                   <li>国内中转: 使用服务商提供的 API 地址</li>
                 </ul>

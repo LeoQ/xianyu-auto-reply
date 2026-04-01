@@ -12,6 +12,8 @@ import time
 import json
 import os
 import re
+import shutil
+import csv
 import uvicorn
 import pandas as pd
 import io
@@ -19,6 +21,7 @@ import asyncio
 from collections import defaultdict
 
 import cookie_manager
+from account_bootstrap_service import account_bootstrap_service
 from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
@@ -351,6 +354,36 @@ import os
 static_dir = os.path.join(os.path.dirname(__file__), 'static')
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
+
+
+def _sync_frontend_dist_to_static():
+    """将前端构建产物同步到后端实际服务的 static 目录。"""
+    frontend_dist_dir = os.path.join(os.path.dirname(__file__), 'frontend', 'dist')
+    if not os.path.isdir(frontend_dist_dir):
+        logger.warning(f"前端构建目录不存在，跳过静态资源同步: {frontend_dist_dir}")
+        return
+
+    entries_to_sync = ['index.html', 'assets', 'favicon.svg']
+    for entry in entries_to_sync:
+        source_path = os.path.join(frontend_dist_dir, entry)
+        target_path = os.path.join(static_dir, entry)
+
+        if not os.path.exists(source_path):
+            continue
+
+        try:
+            if os.path.isdir(source_path):
+                shutil.copytree(source_path, target_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source_path, target_path)
+        except Exception as sync_error:
+            logger.error(f"同步前端静态资源失败: {source_path} -> {target_path}, 错误: {sync_error}")
+            raise
+
+    logger.info(f"前端构建产物已同步到静态目录: {frontend_dist_dir} -> {static_dir}")
+
+
+_sync_frontend_dist_to_static()
 
 app.mount('/static', StaticFiles(directory=static_dir), name='static')
 
@@ -4792,9 +4825,9 @@ class BatchDeleteRequest(BaseModel):
 
 class AIReplySettings(BaseModel):
     ai_enabled: bool
-    model_name: str = "qwen-plus"
+    model_name: str = "qwen3.5-plus"
     api_key: str = ""
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    base_url: str = "https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1"
     max_discount_percent: int = 10
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
@@ -4811,6 +4844,12 @@ class AIReplySettings(BaseModel):
     agent_profile: Dict[str, Any] = {}
     policy_flags: Dict[str, Any] = {}
     training_status: Dict[str, Any] = {}
+
+
+class AccountBootstrapRequest(BaseModel):
+    conversation_limit: int = 200
+    message_limit_per_chat: int = 100
+    force_rebuild: bool = False
 
 
 @app.delete("/items/batch")
@@ -4845,6 +4884,327 @@ def _ensure_cookie_access(cookie_id: str, current_user: Dict[str, Any]) -> None:
     user_cookies = db_manager.get_all_cookies(user_id)
     if cookie_id not in user_cookies:
         raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+
+
+_HISTORY_IMPORT_COLUMN_ALIASES: Dict[str, List[str]] = {
+    'chat_id': ['chat_id', 'chatId', 'conversation_id', 'conversationId', 'cid', '会话ID', '会话id', '聊天ID', '聊天id'],
+    'item_id': ['item_id', 'itemId', '商品ID', '商品id'],
+    'sender_role': ['sender_role', 'senderRole', 'role', 'direction', '发送方', '角色', '方向'],
+    'sender_id': ['sender_id', 'senderId', '发送方ID', '发送者ID', '用户ID', '用户id'],
+    'content': ['content', 'message', 'text', 'body', '消息内容', '内容', '消息', '文本'],
+    'message_type': ['message_type', 'messageType', 'type', '消息类型', '类型'],
+    'is_manual': ['is_manual', 'isManual', 'manual', '人工回复', '是否人工', '是否手动'],
+    'reply_source': ['reply_source', 'replySource', 'source', '消息来源', '来源'],
+    'source_message_id': ['source_message_id', 'sourceMessageId', 'message_id', 'messageId', '消息ID', '消息id'],
+    'source_event_time': ['source_event_time', 'sourceEventTime', 'event_time', 'eventTime', 'time', '时间', '发送时间', '消息时间'],
+}
+
+
+def _clean_history_import_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        compact = value.strip()
+        return compact or None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip() or None
+
+
+def _parse_history_import_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = _clean_history_import_value(value)
+    if text is None:
+        return default
+    lowered = text.lower()
+    if lowered in {'1', 'true', 'yes', 'y', 'manual', '人工', '是'}:
+        return True
+    if lowered in {'0', 'false', 'no', 'n', 'auto', '自动', '否'}:
+        return False
+    return default
+
+
+def _parse_history_sender_role(value: Any) -> Optional[str]:
+    text = _clean_history_import_value(value)
+    if text is None:
+        return None
+    lowered = text.lower()
+    buyer_aliases = {'buyer', 'customer', 'incoming', 'in', '买家', '客户', '用户'}
+    seller_aliases = {'seller', 'assistant', 'agent', 'outgoing', 'out', 'me', 'self', '卖家', '客服', '我方'}
+    if lowered in buyer_aliases or text in buyer_aliases:
+        return 'buyer'
+    if lowered in seller_aliases or text in seller_aliases:
+        return 'seller'
+    return None
+
+
+def _canonicalize_history_import_row(raw_row: Dict[str, Any]) -> Dict[str, Any]:
+    canonical: Dict[str, Any] = {}
+    for target_key, aliases in _HISTORY_IMPORT_COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in raw_row:
+                canonical[target_key] = raw_row.get(alias)
+                break
+    return canonical
+
+
+def _read_history_import_rows(filename: str, contents: bytes) -> List[Dict[str, Any]]:
+    suffix = Path(filename or '').suffix.lower()
+    if suffix in {'.xlsx', '.xls'}:
+        dataframe = pd.read_excel(io.BytesIO(contents))
+        dataframe = dataframe.where(pd.notnull(dataframe), None)
+        return dataframe.to_dict(orient='records')
+
+    if suffix == '.csv':
+        text = contents.decode('utf-8-sig')
+        reader = csv.DictReader(io.StringIO(text))
+        return [dict(row) for row in reader]
+
+    if suffix == '.json':
+        payload = json.loads(contents.decode('utf-8-sig'))
+        if isinstance(payload, dict):
+            for key in ('data', 'rows', 'messages', 'items'):
+                if isinstance(payload.get(key), list):
+                    payload = payload[key]
+                    break
+        if not isinstance(payload, list):
+            raise HTTPException(status_code=400, detail='JSON 文件需为消息对象数组')
+        return [item for item in payload if isinstance(item, dict)]
+
+    if suffix == '.jsonl':
+        rows: List[Dict[str, Any]] = []
+        for line in contents.decode('utf-8-sig').splitlines():
+            compact = line.strip()
+            if not compact:
+                continue
+            item = json.loads(compact)
+            if isinstance(item, dict):
+                rows.append(item)
+        return rows
+
+    raise HTTPException(status_code=400, detail='仅支持 .xlsx/.xls/.csv/.json/.jsonl 文件')
+
+
+def _normalize_history_import_rows(filename: str, raw_rows: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[str]]:
+    normalized_rows: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for index, raw_row in enumerate(raw_rows, start=2):
+        canonical = _canonicalize_history_import_row(raw_row)
+        chat_id = _clean_history_import_value(canonical.get('chat_id'))
+        sender_role = _parse_history_sender_role(canonical.get('sender_role'))
+        content = _clean_history_import_value(canonical.get('content'))
+
+        if not any(_clean_history_import_value(value) for value in raw_row.values()):
+            continue
+
+        if not chat_id or not sender_role or not content:
+            warnings.append(f'第 {index} 行缺少必要字段，已跳过')
+            continue
+
+        item_id = _clean_history_import_value(canonical.get('item_id'))
+        sender_id = _clean_history_import_value(canonical.get('sender_id'))
+        message_type = _clean_history_import_value(canonical.get('message_type')) or 'text'
+        source_message_id = _clean_history_import_value(canonical.get('source_message_id'))
+        source_event_time = _clean_history_import_value(canonical.get('source_event_time'))
+        reply_source = _clean_history_import_value(canonical.get('reply_source'))
+
+        if source_message_id is None:
+            fingerprint = '||'.join([
+                filename or '',
+                chat_id,
+                item_id or '',
+                sender_role,
+                content,
+                source_event_time or '',
+                str(len(normalized_rows) + 1),
+            ])
+            source_message_id = f"import:{hashlib.md5(fingerprint.encode('utf-8')).hexdigest()}"
+
+        is_manual_default = sender_role == 'seller'
+        is_manual = _parse_history_import_bool(canonical.get('is_manual'), default=is_manual_default)
+
+        if not reply_source:
+            if sender_role == 'buyer':
+                reply_source = 'history_incoming'
+            else:
+                reply_source = 'history_manual' if is_manual else 'history_auto'
+
+        normalized_rows.append({
+            'chat_id': chat_id,
+            'item_id': item_id,
+            'sender_role': sender_role,
+            'sender_id': sender_id,
+            'content': content,
+            'message_type': message_type,
+            'reply_source': reply_source,
+            'is_manual': is_manual,
+            'source_message_id': source_message_id,
+            'source_event_time': source_event_time,
+            'metadata': {
+                'import_source': 'offline_history',
+                'import_filename': filename,
+                'import_row': index,
+            },
+        })
+
+    if not normalized_rows:
+        detail = '导入文件中没有可用消息'
+        if warnings:
+            detail = f"{detail}，请检查必填列：chat_id/会话ID、sender_role/发送方、content/内容"
+        raise HTTPException(status_code=400, detail=detail)
+
+    return normalized_rows, warnings
+
+
+def _import_history_and_rebuild(
+    cookie_id: str,
+    filename: str,
+    normalized_rows: List[Dict[str, Any]],
+    force_rebuild: bool = False,
+) -> Dict[str, Any]:
+    chat_ids: List[str] = []
+    imported_messages = 0
+
+    job_id = db_manager.create_account_bootstrap_job(
+        cookie_id,
+        trigger_mode='manual_import',
+        conversation_limit=len({row['chat_id'] for row in normalized_rows}),
+        message_limit_per_chat=max(1, len(normalized_rows)),
+    )
+
+    if not job_id:
+        raise HTTPException(status_code=500, detail='创建导入任务失败')
+
+    try:
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='syncing_history',
+            imported_conversations=0,
+            imported_messages=0,
+            extracted_samples=0,
+            progress_json={
+                'status': 'syncing_history',
+                'stage': 'syncing_history',
+                'current_step': f'正在导入文件 {filename}',
+                'warnings': [],
+            },
+        )
+
+        for row in normalized_rows:
+            result_id = db_manager.save_conversation_message(
+                cookie_id=cookie_id,
+                chat_id=row['chat_id'],
+                item_id=row.get('item_id'),
+                sender_role=row['sender_role'],
+                sender_id=row.get('sender_id'),
+                content=row['content'],
+                message_type=row.get('message_type') or 'text',
+                reply_source=row.get('reply_source'),
+                is_manual=bool(row.get('is_manual')),
+                source_event_time=row.get('source_event_time'),
+                source_message_id=row.get('source_message_id'),
+                source_chat_id=row['chat_id'],
+                metadata=row.get('metadata') or {},
+            )
+            if result_id:
+                imported_messages += 1
+                chat_ids.append(row['chat_id'])
+
+        imported_conversations = len(set(chat_ids))
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='extracting_samples',
+            imported_conversations=imported_conversations,
+            imported_messages=imported_messages,
+            progress_json={
+                'status': 'extracting_samples',
+                'stage': 'extracting_samples',
+                'current_step': '提取导入消息中的人工风格样本',
+            },
+        )
+
+        extracted_samples = account_bootstrap_service._extract_style_samples(
+            cookie_id,
+            chat_ids,
+            force_rebuild=force_rebuild,
+        )
+
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='building_profile',
+            imported_conversations=imported_conversations,
+            imported_messages=imported_messages,
+            extracted_samples=extracted_samples,
+            progress_json={
+                'status': 'building_profile',
+                'stage': 'building_profile',
+                'current_step': '根据导入消息重建账号画像',
+            },
+        )
+
+        profile_result = ai_reply_engine.rebuild_agent_profile(cookie_id)
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='ready',
+            imported_conversations=imported_conversations,
+            imported_messages=imported_messages,
+            extracted_samples=extracted_samples,
+            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+            progress_json={
+                'status': 'ready',
+                'stage': 'ready',
+                'current_step': '导入完成',
+                'import_filename': filename,
+            },
+        )
+
+        return {
+            'success': True,
+            'message': '历史消息导入完成',
+            'imported_conversations': imported_conversations,
+            'imported_messages': imported_messages,
+            'extracted_samples': extracted_samples,
+            'agent_profile': profile_result.get('agent_profile') or db_manager.get_agent_profile(cookie_id),
+            'training_status': profile_result.get('training_status') or db_manager.get_bootstrap_summary(cookie_id),
+            'sample_stats': profile_result.get('sample_stats') or db_manager.get_reply_style_stats(cookie_id),
+            'bootstrap_status': db_manager.get_bootstrap_summary(cookie_id),
+        }
+    except HTTPException:
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='failed',
+            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+            error_message='导入失败',
+            progress_json={
+                'status': 'failed',
+                'stage': 'failed',
+                'current_step': '导入失败',
+            },
+        )
+        raise
+    except Exception as exc:
+        db_manager.update_account_bootstrap_job(
+            job_id,
+            status='failed',
+            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+            error_message=str(exc),
+            progress_json={
+                'status': 'failed',
+                'stage': 'failed',
+                'current_step': '导入失败',
+                'error_message': str(exc),
+            },
+        )
+        raise
 
 @app.get("/ai-reply-settings/{cookie_id}")
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -4925,6 +5285,87 @@ def rebuild_ai_agent_profile(cookie_id: str, current_user: Dict[str, Any] = Depe
         raise
     except Exception as e:
         logger.error(f"重建账号画像异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.post("/ai-agent/{cookie_id}/bootstrap")
+def bootstrap_ai_agent(
+    cookie_id: str,
+    request: AccountBootstrapRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """手动启动账号初始化任务"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+        result = account_bootstrap_service.start_bootstrap(
+            cookie_id=cookie_id,
+            conversation_limit=max(1, min(request.conversation_limit, 500)),
+            message_limit_per_chat=max(1, min(request.message_limit_per_chat, 200)),
+            force_rebuild=bool(request.force_rebuild),
+            trigger_mode='manual',
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"启动账号初始化异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.get("/ai-agent/{cookie_id}/bootstrap-status")
+def get_ai_agent_bootstrap_status(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号初始化任务状态"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+        return account_bootstrap_service.get_status(cookie_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取账号初始化状态异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.post("/ai-agent/{cookie_id}/import-history")
+async def import_ai_agent_history(
+    cookie_id: str,
+    file: UploadFile = File(...),
+    force_rebuild: bool = Form(False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """导入离线历史消息并重建账号画像"""
+    try:
+        _ensure_cookie_access(cookie_id, current_user)
+
+        if not file.filename:
+            raise HTTPException(status_code=400, detail='请选择要导入的文件')
+
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail='上传文件为空')
+
+        raw_rows = _read_history_import_rows(file.filename, contents)
+        normalized_rows, warnings = _normalize_history_import_rows(file.filename, raw_rows)
+        result = _import_history_and_rebuild(
+            cookie_id=cookie_id,
+            filename=file.filename,
+            normalized_rows=normalized_rows,
+            force_rebuild=force_rebuild,
+        )
+        if warnings:
+            result['warnings'] = warnings[:20]
+        return result
+    except HTTPException:
+        raise
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail='导入文件为空')
+    except pd.errors.ParserError:
+        raise HTTPException(status_code=400, detail='导入文件格式错误')
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail='JSON 文件格式错误')
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail='文件编码无法识别，请使用 UTF-8 编码')
+    except Exception as e:
+        logger.error(f"导入历史消息失败: {e}")
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
@@ -6092,6 +6533,7 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
+            'account_bootstrap_jobs',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', "item_replay",
             'risk_control_logs'
@@ -6131,6 +6573,7 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
+            'account_bootstrap_jobs',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay'
         ]
@@ -6172,6 +6615,7 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
             'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'conversation_messages', 'reply_style_samples', 'agent_profiles', 'reply_generation_traces',
+            'account_bootstrap_jobs',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', 'item_replay',
             'risk_control_logs'
@@ -6350,7 +6794,20 @@ def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_curre
 # 然后由 React Router 在客户端处理路由
 
 # 定义不需要返回前端页面的路径前缀（API 路径）
-API_PREFIXES = ['/api/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
+API_PREFIXES = [
+    '/api/',
+    '/static/',
+    '/health',
+    '/login',
+    '/logout',
+    '/register',
+    '/verify',
+    '/check-default-password',
+    '/change-password',
+    '/change-admin-password',
+    '/ai-agent/',
+    '/ai-reply-settings',
+]
 
 @app.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):

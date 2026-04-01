@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from loguru import logger
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
 from db_manager import db_manager
 
@@ -92,6 +92,10 @@ def _extract_text_features(text: str) -> List[str]:
             if gram:
                 tokens.append(gram)
     return _unique_preserve(tokens)
+
+
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    return any(keyword and keyword in text for keyword in keywords)
 
 
 def _jaccard_similarity(left: List[str], right: List[str]) -> float:
@@ -278,6 +282,76 @@ class StyleExampleRetriever:
         return [sample for _, sample in ranked[:limit]]
 
 
+class ConversationScopeGuard:
+    BUSINESS_KEYWORDS = [
+        '在吗', '还在', '有吗', '包邮', '顺丰', '快递', '发货', '物流', '自提', '同城',
+        '价格', '多少', '便宜', '优惠', '刀', '小刀', '砍价', '最低', '包', '拍下',
+        '成色', '几新', '瑕疵', '附件', '配件', '功能', '参数', '使用', '能用', '好用',
+        '售后', '退款', '退货', '换货', '保修', '真假', '原装', '激活', '验机'
+    ]
+    OFF_TOPIC_KEYWORDS = [
+        '天气', '新闻', '八卦', '热搜', '股票', '基金', '彩票', '币圈', '星座', '运势',
+        '算命', '塔罗', '生肖', '笑话', '脑筋急转弯', '写代码', '编程', 'python', 'java',
+        '翻译', '作文', '论文', '作业', '数学题', '英语题', '借钱', '红包', '转账',
+        '几岁', '多大', '哪里人', '结婚', '对象', '身高', '体重', '吃饭', '睡了吗'
+    ]
+    ITEM_STOPWORDS = {
+        '全新', '二手', '闲置', '转让', '出售', '商品', '宝贝', '支持', '可以', '一个',
+        '这个', '那个', '正品', '原装', '官方', '版本', '型号', '详情', '默认', '链接'
+    }
+
+    def _extract_item_tokens(self, item_info: dict) -> List[str]:
+        source = " ".join([
+            str(item_info.get('title') or ''),
+            str(item_info.get('desc') or ''),
+        ])
+        tokens = []
+        for token in re.findall(r'[\u4e00-\u9fff]{2,6}|[a-zA-Z0-9]{2,}', source.lower()):
+            cleaned = token.strip()
+            if not cleaned or cleaned in self.ITEM_STOPWORDS:
+                continue
+            tokens.append(cleaned)
+        return _unique_preserve(tokens[:80])
+
+    def assess(self, message: str, item_info: dict, context: List[Dict[str, str]]) -> Dict[str, Any]:
+        normalized = _normalize_text(message)
+        compact = _compact_text(message)
+        if not normalized:
+            return {'is_relevant': False, 'reason': 'empty'}
+
+        if compact in IntentClassifier.GREETING_MESSAGES or compact in IntentClassifier.AVAILABILITY_MESSAGES:
+            return {'is_relevant': True, 'reason': 'greeting_or_availability'}
+
+        if _contains_any(normalized.lower(), self.BUSINESS_KEYWORDS):
+            return {'is_relevant': True, 'reason': 'business_keyword'}
+
+        message_tokens = set(_extract_text_features(normalized))
+        item_tokens = self._extract_item_tokens(item_info)
+        item_overlap = [token for token in item_tokens if token in message_tokens or token in normalized.lower()]
+        if item_overlap:
+            return {'is_relevant': True, 'reason': 'item_overlap', 'matched_tokens': item_overlap[:5]}
+
+        # 同一会话里的短追问，允许沿用上下文继续沟通
+        if context and len(normalized) <= 8:
+            follow_up_markers = ['这个', '那这个', '那款', '可以吗', '行吗', '多少', '包吗', '怎么拍', '能拍']
+            if _contains_any(normalized, follow_up_markers):
+                return {'is_relevant': True, 'reason': 'short_follow_up'}
+
+        if _contains_any(normalized.lower(), self.OFF_TOPIC_KEYWORDS):
+            return {'is_relevant': False, 'reason': 'off_topic_keyword'}
+
+        unrelated_patterns = [
+            r'你(是|会|能不能).*(算命|看相|占卜|塔罗)',
+            r'帮我.*(写|做).*(代码|程序|作业|论文)',
+            r'(今天|明天).*(天气|热搜|新闻)',
+            r'你.*(几岁|多大|哪里人|结婚)',
+        ]
+        if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in unrelated_patterns):
+            return {'is_relevant': False, 'reason': 'off_topic_pattern'}
+
+        return {'is_relevant': True, 'reason': 'default_allow'}
+
+
 class PromptCompiler:
     def __init__(self, default_prompts: Dict[str, str]):
         self.default_prompts = default_prompts
@@ -356,6 +430,8 @@ class PromptCompiler:
 请生成一条符合该账号人设的回复：
 - 保持自然、像真人
 - 只回答当前问题，不要跳到别的话题
+- 只能回复与当前商品、交易流程、物流、售后、议价或当前会话衔接相关的问题
+- 如果用户问题与当前商品或当前会话无关，直接输出：EMPTY_REPLY
 - 如果用户只是打招呼/问在不在，只需简短确认，不要主动报价格、包邮、优惠、库存数量、留货
 - 如果用户没有问价格，不要主动给价格方案或砍价方案
 - 不要编造库存数量、销量、售后承诺、保留名额、帮忙留货
@@ -380,6 +456,11 @@ class ReplyGuard:
             'fallback_used': False,
             'normalized_intent_reply': False,
         }
+
+        if raw_reply == 'EMPTY_REPLY':
+            guard_result['fallback_used'] = True
+            guard_result['reason'] = 'empty_reply_sentinel'
+            return 'EMPTY_REPLY', guard_result
 
         if not raw_reply:
             guard_result['fallback_used'] = True
@@ -444,6 +525,7 @@ class ReplyOrchestrator:
         self.intent_classifier = IntentClassifier()
         self.persona_resolver = PersonaResolver()
         self.style_retriever = StyleExampleRetriever()
+        self.scope_guard = ConversationScopeGuard()
         self.prompt_compiler = PromptCompiler(engine.default_prompts)
         self.reply_guard = ReplyGuard()
         self.trace_recorder = TraceRecorder()
@@ -484,6 +566,26 @@ class ReplyOrchestrator:
             return result
 
         context = self.engine.get_conversation_context(chat_id, cookie_id)
+        scope_result = self.scope_guard.assess(message, item_info, context)
+        if not scope_result.get('is_relevant', True):
+            result = OrchestratorResult(
+                reply='EMPTY_REPLY',
+                intent=intent,
+                raw_reply='EMPTY_REPLY',
+                compiled_prompt='',
+                system_prompt='',
+                user_prompt='',
+                persona={},
+                style_examples=[],
+                guard_result={'fallback_used': True, 'reason': 'off_topic_blocked', 'scope_result': scope_result},
+                strategy_version=settings.get('strategy_version', 'rag-v1'),
+                prompt_version=settings.get('prompt_version', 'v2'),
+                model_name=settings.get('model_name', ''),
+            )
+            if save_trace:
+                self.trace_recorder.record(cookie_id, chat_id, result)
+            return result
+
         persona = self.persona_resolver.resolve(cookie_id, settings, {**item_info, 'item_id': item_id})
 
         style_examples: List[Dict[str, Any]] = []
@@ -612,7 +714,9 @@ class AIReplyEngine:
             )
             client = OpenAI(
                 api_key=settings['api_key'],
-                base_url=settings.get('base_url')
+                base_url=settings.get('base_url'),
+                timeout=45.0,
+                max_retries=1,
             )
             return client
         except Exception as e:
@@ -629,6 +733,15 @@ class AIReplyEngine:
     def _is_gemini_api(self, settings: dict) -> bool:
         model_name = settings.get('model_name', '').lower()
         return 'gemini' in model_name
+
+    def _build_openai_extra_body(self, settings: dict) -> Dict[str, Any]:
+        base_url = (settings.get('base_url') or '').lower()
+        model_name = (settings.get('model_name') or '').lower()
+
+        # qwen3.5-plus 在百炼侧默认开启思考模式，客服短回复显式关闭可显著降低延迟。
+        if 'dashscope.aliyuncs.com' in base_url and model_name.startswith('qwen3.5'):
+            return {'enable_thinking': False}
+        return {}
 
     def _select_provider(self, settings: dict) -> BaseAIProvider:
         if self._is_dashscope_api(settings):
@@ -718,17 +831,52 @@ class AIReplyEngine:
             raise Exception(f"Gemini API 响应格式错误: {result}")
 
     def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
-        try:
-            response = client.chat.completions.create(
-                model=settings['model_name'],
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"OpenAI API调用失败: {e}")
-            raise
+        last_error: Optional[Exception] = None
+        current_client = client
+
+        for attempt in range(2):
+            try:
+                extra_body = self._build_openai_extra_body(settings)
+                response = current_client.responses.create(
+                    model=settings['model_name'],
+                    input=messages,
+                    max_output_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body=extra_body or None,
+                )
+                output_text = (getattr(response, 'output_text', '') or '').strip()
+                if output_text:
+                    return output_text
+
+                output = getattr(response, 'output', None) or []
+                text_parts: List[str] = []
+                for item in output:
+                    for content in getattr(item, 'content', None) or []:
+                        if getattr(content, 'type', None) == 'output_text' and getattr(content, 'text', None):
+                            text_parts.append(content.text)
+
+                merged_text = "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
+                if merged_text:
+                    return merged_text
+
+                raise ValueError("Responses API 未返回可解析的文本内容")
+            except (APIConnectionError, APITimeoutError) as e:
+                last_error = e
+                logger.warning(f"OpenAI API连接异常，第 {attempt + 1} 次尝试失败: {e}")
+                if attempt == 0:
+                    refreshed_client = self._create_openai_client(settings)
+                    if refreshed_client:
+                        current_client = refreshed_client
+                    continue
+                logger.error(f"OpenAI API调用失败: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"OpenAI API调用失败: {e}")
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("OpenAI API调用失败")
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
         settings = db_manager.get_ai_reply_settings(cookie_id)
@@ -796,6 +944,10 @@ class AIReplyEngine:
                 )
 
                 # orchestrator 内部 save_history=False，因此这里统一保存 assistant，避免重复。
+                if result.reply == "EMPTY_REPLY":
+                    logger.info(f"AI判定当前消息与商品/会话无关，跳过回复 (账号: {cookie_id})")
+                    return "EMPTY_REPLY"
+
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", result.reply, result.intent)
                 logger.info(f"AI回复生成成功 (账号: {cookie_id}): {result.reply}")
                 return result.reply
@@ -883,17 +1035,23 @@ class AIReplyEngine:
         stats = db_manager.get_reply_style_stats(cookie_id)
 
         if len(samples) < settings.get('min_style_samples', 5):
+            profile = self._build_profile_heuristically(cookie_id, settings, samples)
+            save_ok = db_manager.save_agent_profile(cookie_id, profile, status='draft')
             training_status = {
-                'status': 'insufficient_samples',
+                'status': 'draft',
                 'sample_count': len(samples),
                 'required_samples': settings.get('min_style_samples', 5),
                 'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'mode': 'heuristic',
+                'bootstrap_ready': bool(save_ok),
             }
+            settings['agent_profile'] = profile
             settings['training_status'] = training_status
             db_manager.save_ai_reply_settings(cookie_id, settings)
             return {
-                'success': False,
-                'message': '样本数量不足，暂时无法重建画像',
+                'success': bool(save_ok),
+                'message': '样本不足，已生成基础画像',
+                'agent_profile': profile,
                 'training_status': training_status,
                 'sample_stats': stats,
             }
@@ -921,10 +1079,15 @@ class AIReplyEngine:
 
     def get_agent_stats(self, cookie_id: str) -> Dict[str, Any]:
         settings = db_manager.get_ai_reply_settings(cookie_id)
+        bootstrap_status = db_manager.get_bootstrap_summary(cookie_id)
         return {
             'cookie_id': cookie_id,
             'sample_stats': db_manager.get_reply_style_stats(cookie_id),
             'training_status': settings.get('training_status', {}),
+            'bootstrap_status': bootstrap_status,
+            'last_bootstrap_at': bootstrap_status.get('finished_at') or bootstrap_status.get('updated_at'),
+            'imported_conversations': bootstrap_status.get('imported_conversations', 0),
+            'imported_messages': bootstrap_status.get('imported_messages', 0),
             'prompt_version': settings.get('prompt_version', 'v2'),
             'strategy_version': settings.get('strategy_version', 'rag-v1'),
             'recent_traces': db_manager.get_recent_reply_generation_traces(cookie_id, limit=10),
@@ -943,6 +1106,7 @@ class AIReplyEngine:
             reply_source='incoming',
             is_manual=False,
             source_event_time=source_event_time,
+            source_chat_id=chat_id,
         )
 
     def record_manual_reply(self, cookie_id: str, chat_id: str, user_id: str, item_id: str,
@@ -958,6 +1122,7 @@ class AIReplyEngine:
             reply_source='manual',
             is_manual=True,
             source_event_time=source_event_time,
+            source_chat_id=chat_id,
         )
 
         settings = db_manager.get_ai_reply_settings(cookie_id)
@@ -988,6 +1153,8 @@ class AIReplyEngine:
             intent=intent,
             embedding=embedding,
             is_active=True,
+            source_buyer_message_id=buyer_message.get('source_message_id') or str(buyer_message.get('id')),
+            source_reply_message_id=str(message_id) if message_id else None,
         )
 
     def record_auto_reply(self, cookie_id: str, chat_id: str, user_id: str, item_id: str, content: str,
@@ -1003,6 +1170,7 @@ class AIReplyEngine:
             reply_source=reply_source,
             is_manual=False,
             source_event_time=None,
+            source_chat_id=chat_id,
         )
 
     def _score_style_sample(self, buyer_message: str, human_reply: str) -> float:

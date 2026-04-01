@@ -47,8 +47,8 @@ services:
       - BATCH_DATA_LOCK_TIMEOUT=${BATCH_DATA_LOCK_TIMEOUT:-5}
       # AI回复相关配置
       - AI_REPLY_ENABLED=${AI_REPLY_ENABLED:-false}
-      - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-qwen-plus}
-      - DEFAULT_AI_BASE_URL=${DEFAULT_AI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-qwen3.5-plus}
+      - DEFAULT_AI_BASE_URL=${DEFAULT_AI_BASE_URL:-https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1}
       - AI_REQUEST_TIMEOUT=${AI_REQUEST_TIMEOUT:-30}
       - AI_MAX_TOKENS=${AI_MAX_TOKENS:-100}
       - WEBSOCKET_URL=${WEBSOCKET_URL:-wss://wss-goofish.dingtalk.com/}

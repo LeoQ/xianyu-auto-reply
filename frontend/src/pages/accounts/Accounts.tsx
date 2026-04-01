@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Eye, EyeOff, AlertTriangle } from 'lucide-react'
-import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, updateAccountLoginInfo, previewAIReplyAgent, rebuildAIReplyProfile, getAIAgentStats, type AIReplySettings, type AISampleStats } from '@/api/accounts'
+import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Eye, EyeOff, AlertTriangle, Upload, HelpCircle } from 'lucide-react'
+import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, updateAccountLoginInfo, previewAIReplyAgent, rebuildAIReplyProfile, getAIAgentStats, bootstrapAIAgent, getAIBootstrapStatus, importAIAgentHistory, type AIReplySettings, type AISampleStats, type AIBootstrapStatus } from '@/api/accounts'
 import { getKeywords, getDefaultReply, updateDefaultReply } from '@/api/keywords'
 import { checkDefaultPassword } from '@/api/settings'
 import { useUIStore } from '@/store/uiStore'
@@ -14,6 +14,7 @@ type ModalType = 'qrcode' | 'password' | 'manual' | 'edit' | 'default-reply' | '
 interface AccountWithKeywordCount extends AccountDetail {
   keywordCount?: number
   aiEnabled?: boolean
+  bootstrapStatus?: string
 }
 
 const splitByLineOrComma = (value: string) =>
@@ -96,6 +97,9 @@ export function Accounts() {
   const [aiSampleReply, setAiSampleReply] = useState('')
   const [aiTrainingStatus, setAiTrainingStatus] = useState<Record<string, unknown>>({})
   const [aiSampleStats, setAiSampleStats] = useState<AISampleStats | null>(null)
+  const [aiBootstrapStatus, setAiBootstrapStatus] = useState<AIBootstrapStatus | null>(null)
+  const [aiBootstrapping, setAiBootstrapping] = useState(false)
+  const [aiImportingHistory, setAiImportingHistory] = useState(false)
   const [aiRebuildingProfile, setAiRebuildingProfile] = useState(false)
   const [aiPreviewMessage, setAiPreviewMessage] = useState('这个还能便宜点吗？')
   const [aiPreviewReply, setAiPreviewReply] = useState('')
@@ -103,6 +107,46 @@ export function Accounts() {
   const [aiPreviewLoading, setAiPreviewLoading] = useState(false)
   const [aiSettingsSaving, setAiSettingsSaving] = useState(false)
   const [aiSettingsLoading, setAiSettingsLoading] = useState(false)
+  const aiHistoryFileInputRef = useRef<HTMLInputElement | null>(null)
+
+  const runningBootstrapStates = ['pending', 'syncing_history', 'extracting_samples', 'building_profile']
+
+  const getBootstrapStatusLabel = (status?: string) => {
+    switch (status) {
+      case 'pending':
+        return '排队中'
+      case 'syncing_history':
+        return '拉历史中'
+      case 'extracting_samples':
+        return '提样本中'
+      case 'building_profile':
+        return '生成人设中'
+      case 'ready':
+        return '已完成'
+      case 'failed':
+        return '失败'
+      case 'draft':
+        return '草稿画像'
+      default:
+        return '未初始化'
+    }
+  }
+
+  const getBootstrapStatusClassName = (status?: string) => {
+    switch (status) {
+      case 'ready':
+        return 'badge-success'
+      case 'failed':
+        return 'badge-danger'
+      case 'syncing_history':
+      case 'extracting_samples':
+      case 'building_profile':
+      case 'pending':
+        return 'badge-warning'
+      default:
+        return 'badge-gray'
+    }
+  }
 
   const loadAccounts = async () => {
     if (!_hasHydrated || !isAuthenticated || !token) return
@@ -127,12 +171,14 @@ export function Accounts() {
               ...account,
               keywordCount: keywords.length,
               aiEnabled: aiSettings[account.id]?.ai_enabled ?? aiSettings[account.id]?.enabled ?? false,
+              bootstrapStatus: String(aiSettings[account.id]?.training_status?.status ?? 'idle'),
             }
           } catch {
             return {
               ...account,
               keywordCount: 0,
               aiEnabled: aiSettings[account.id]?.ai_enabled ?? aiSettings[account.id]?.enabled ?? false,
+              bootstrapStatus: String(aiSettings[account.id]?.training_status?.status ?? 'idle'),
             }
           }
         }),
@@ -186,6 +232,10 @@ export function Accounts() {
     setManualAccountId('')
     setManualCookie('')
     setManualLoading(false)
+    setAiImportingHistory(false)
+    if (aiHistoryFileInputRef.current) {
+      aiHistoryFileInputRef.current.value = ''
+    }
   }, [clearQrCheck])
 
   // ==================== 扫码登录 ====================
@@ -566,6 +616,14 @@ export function Accounts() {
       setAiSampleReply(settings.agent_profile?.sample_reply ?? '')
       setAiTrainingStatus(settings.training_status ?? stats?.training_status ?? {})
       setAiSampleStats(settings.sample_stats ?? stats?.sample_stats ?? null)
+      setAiBootstrapStatus(
+        stats?.bootstrap_status ??
+        ({
+          cookie_id: account.id,
+          status: String((settings.training_status ?? {})['status'] ?? 'idle'),
+          ...(settings.training_status ?? {}),
+        } as AIBootstrapStatus)
+      )
       setAiPreviewReply('')
       setAiPreviewPrompt('')
     } catch {
@@ -645,6 +703,96 @@ export function Accounts() {
     }
   }
 
+  const refreshBootstrapStatus = useCallback(async (cookieId: string) => {
+    const status = await getAIBootstrapStatus(cookieId)
+    setAccounts(prev => prev.map(account =>
+      account.id === cookieId ? { ...account, bootstrapStatus: status.status } : account,
+    ))
+    if (aiSettingsAccount?.id === cookieId) {
+      setAiBootstrapStatus(status)
+      setAiTrainingStatus(status as unknown as Record<string, unknown>)
+    }
+    return status
+  }, [aiSettingsAccount])
+
+  const handleBootstrapAccount = async (account: AccountWithKeywordCount) => {
+    try {
+      setAiBootstrapping(true)
+      const result = await bootstrapAIAgent(account.id)
+      if (result.success === false) {
+        addToast({ type: 'warning', message: result.message || '初始化任务已在运行中' })
+        return
+      }
+      const bootstrapStatus: AIBootstrapStatus = {
+        ...result,
+        cookie_id: result.cookie_id ?? account.id,
+        status: result.status ?? 'pending',
+      }
+      setAccounts(prev => prev.map(item =>
+        item.id === account.id ? { ...item, bootstrapStatus: bootstrapStatus.status } : item,
+      ))
+      if (aiSettingsAccount?.id === account.id) {
+        setAiBootstrapStatus(bootstrapStatus)
+        setAiTrainingStatus(bootstrapStatus as unknown as Record<string, unknown>)
+      }
+      addToast({ type: 'success', message: result.message || '初始化任务已启动' })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '初始化任务启动失败'
+      addToast({ type: 'error', message })
+    } finally {
+      setAiBootstrapping(false)
+    }
+  }
+
+  const handleChooseHistoryFile = () => {
+    aiHistoryFileInputRef.current?.click()
+  }
+
+  const handleImportHistoryFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file || !aiSettingsAccount) return
+
+    try {
+      setAiImportingHistory(true)
+      const result = await importAIAgentHistory(aiSettingsAccount.id, file)
+      if (result.agent_profile) {
+        setAiPersonaName(result.agent_profile.persona_name ?? '')
+        setAiToneTags((result.agent_profile.tone_tags ?? []).join(', '))
+        setAiSpeakingRules((result.agent_profile.speaking_rules ?? []).join('\n'))
+        setAiForbiddenPhrases((result.agent_profile.forbidden_phrases ?? []).join(', '))
+        setAiSalesStyle(result.agent_profile.sales_style ?? '')
+        setAiServiceStyle(result.agent_profile.service_style ?? '')
+        setAiSampleReply(result.agent_profile.sample_reply ?? '')
+      }
+      if (result.sample_stats) {
+        setAiSampleStats(result.sample_stats)
+      }
+      if (result.training_status) {
+        setAiTrainingStatus(result.training_status)
+      }
+      if (result.bootstrap_status) {
+        setAiBootstrapStatus(result.bootstrap_status)
+        setAccounts(prev => prev.map(account =>
+          account.id === aiSettingsAccount.id ? { ...account, bootstrapStatus: result.bootstrap_status?.status } : account,
+        ))
+      }
+
+      const warningText = result.warnings && result.warnings.length > 0
+        ? `，另有 ${result.warnings.length} 行已跳过`
+        : ''
+      addToast({
+        type: 'success',
+        message: `已导入 ${result.imported_messages} 条消息，提取 ${result.extracted_samples} 条样本${warningText}`,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '导入历史消息失败'
+      addToast({ type: 'error', message })
+    } finally {
+      setAiImportingHistory(false)
+      e.target.value = ''
+    }
+  }
+
   const handlePreviewAIReply = async () => {
     if (!aiSettingsAccount || !aiPreviewMessage.trim()) return
     try {
@@ -666,6 +814,18 @@ export function Accounts() {
   useEffect(() => {
     return () => clearQrCheck()
   }, [clearQrCheck])
+
+  useEffect(() => {
+    if (!aiSettingsAccount || !aiBootstrapStatus?.status) return
+    if (!runningBootstrapStates.includes(aiBootstrapStatus.status)) return
+
+    const timer = setInterval(() => {
+      refreshBootstrapStatus(aiSettingsAccount.id)
+        .catch(() => undefined)
+    }, 3000)
+
+    return () => clearInterval(timer)
+  }, [aiBootstrapStatus?.status, aiSettingsAccount, refreshBootstrapStatus])
 
   if (loading) {
     return <PageLoading />
@@ -815,6 +975,24 @@ export function Accounts() {
                     </td>
                     <td>
                       <div className="flex items-center gap-1 flex-wrap">
+                        <span className={getBootstrapStatusClassName(account.bootstrapStatus)}>
+                          {getBootstrapStatusLabel(account.bootstrapStatus)}
+                        </span>
+                        {account.bootstrapStatus !== 'ready' && (
+                          <button
+                            onClick={() => handleBootstrapAccount(account)}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors"
+                            title="初始化账号"
+                            disabled={aiBootstrapping}
+                          >
+                            {aiBootstrapping && aiSettingsAccount?.id === account.id ? (
+                              <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />
+                            ) : (
+                              <RefreshCw className="w-3.5 h-3.5 text-blue-500" />
+                            )}
+                            <span className="text-blue-600 dark:text-blue-400">初始化账号</span>
+                          </button>
+                        )}
                         <button
                           onClick={() => openAISettings(account)}
                           className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-purple-50 dark:hover:bg-purple-900/30 transition-colors"
@@ -1366,6 +1544,117 @@ export function Accounts() {
                       disabled
                       className="input-ios bg-slate-100 dark:bg-slate-700"
                     />
+                  </div>
+
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-700 p-4 space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium text-slate-800 dark:text-slate-100">账号初始化</div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400">
+                          历史会话导入、风格样本提取和画像生成会在后台执行
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 relative">
+                        <span className={getBootstrapStatusClassName(aiBootstrapStatus?.status)}>
+                          {getBootstrapStatusLabel(aiBootstrapStatus?.status)}
+                        </span>
+                        <input
+                          ref={aiHistoryFileInputRef}
+                          type="file"
+                          accept=".xlsx,.xls,.csv,.json,.jsonl"
+                          className="hidden"
+                          onChange={handleImportHistoryFile}
+                        />
+                        <button
+                          type="button"
+                          onClick={handleChooseHistoryFile}
+                          className="btn-ios-secondary"
+                          disabled={aiImportingHistory}
+                        >
+                          {aiImportingHistory ? (
+                            <span className="flex items-center gap-2">
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              导入中...
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-2">
+                              <Upload className="w-4 h-4" />
+                              导入消息
+                            </span>
+                          )}
+                        </button>
+                        <details className="relative">
+                          <summary className="list-none cursor-pointer rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">
+                            <span className="flex items-center gap-1.5">
+                              <HelpCircle className="w-3.5 h-3.5" />
+                              格式说明
+                            </span>
+                          </summary>
+                          <div className="absolute right-0 top-full z-10 mt-2 w-[360px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-xl space-y-3 text-xs text-slate-600 dark:text-slate-300">
+                            <div>
+                              支持 `.xlsx/.xls/.csv/.json/.jsonl`
+                            </div>
+                            <div>
+                              必填列：`chat_id` 或 `会话ID`、`sender_role` 或 `发送方`、`content` 或 `内容`
+                            </div>
+                            <div>
+                              发送方填写：`buyer/买家`、`seller/卖家/客服`
+                            </div>
+                            <div>
+                              可选列：`item_id`、`sender_id`、`message_type`、`is_manual`、`source_message_id`、`source_event_time`
+                            </div>
+                            <div className="rounded-lg bg-slate-50 dark:bg-slate-800 p-3 font-mono leading-5 whitespace-pre-wrap break-all">
+                              chat_id,sender_role,content,item_id,source_event_time{"\n"}
+                              chat_001,buyer,这个还在吗,123456,2026-04-01 10:00:00{"\n"}
+                              chat_001,seller,在的哈 喜欢可以直接拍,123456,2026-04-01 10:01:00
+                            </div>
+                          </div>
+                        </details>
+                        {aiBootstrapStatus?.status !== 'ready' && (
+                          <button
+                            type="button"
+                            onClick={() => handleBootstrapAccount(aiSettingsAccount)}
+                            className="btn-ios-secondary"
+                            disabled={aiBootstrapping}
+                          >
+                            {aiBootstrapping ? (
+                              <span className="flex items-center gap-2">
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                启动中...
+                              </span>
+                            ) : (
+                              '初始化账号'
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {aiBootstrapStatus && (
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div>
+                          <div className="text-slate-500">导入会话</div>
+                          <div className="font-semibold text-slate-900 dark:text-white">{aiBootstrapStatus.imported_conversations ?? 0}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">导入消息</div>
+                          <div className="font-semibold text-slate-900 dark:text-white">{aiBootstrapStatus.imported_messages ?? 0}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">提取样本</div>
+                          <div className="font-semibold text-slate-900 dark:text-white">{aiBootstrapStatus.extracted_samples ?? 0}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">当前步骤</div>
+                          <div className="font-semibold text-slate-900 dark:text-white">{String(aiBootstrapStatus.current_step ?? '未开始')}</div>
+                        </div>
+                      </div>
+                    )}
+                    {aiBootstrapStatus?.error_message && (
+                      <div className="text-sm text-red-500">{aiBootstrapStatus.error_message}</div>
+                    )}
+                    <div className="text-xs text-slate-500 dark:text-slate-400 leading-5">
+                      卖家消息默认按人工回复计入风格样本；点“格式说明”可查看导入字段和示例。
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-4">

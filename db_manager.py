@@ -19,6 +19,10 @@ from loguru import logger
 PBKDF2_ALGORITHM = 'sha256'
 PBKDF2_ITERATIONS = 390000
 PBKDF2_SALT_BYTES = 16
+DEFAULT_AI_MODEL = 'qwen3.5-plus'
+LEGACY_DEFAULT_AI_MODEL = 'qwen-plus'
+DEFAULT_AI_BASE_URL = 'https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1'
+LEGACY_DEFAULT_AI_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
@@ -160,9 +164,9 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS ai_reply_settings (
                 cookie_id TEXT PRIMARY KEY,
                 ai_enabled BOOLEAN DEFAULT FALSE,
-                model_name TEXT DEFAULT 'qwen-plus',
+                model_name TEXT DEFAULT 'qwen3.5-plus',
                 api_key TEXT,
-                base_url TEXT DEFAULT 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                base_url TEXT DEFAULT 'https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1',
                 max_discount_percent INTEGER DEFAULT 10,
                 max_discount_amount INTEGER DEFAULT 100,
                 max_bargain_rounds INTEGER DEFAULT 3,
@@ -214,6 +218,9 @@ class DBManager:
                 message_type TEXT DEFAULT 'text',
                 reply_source TEXT,
                 is_manual BOOLEAN DEFAULT FALSE,
+                source_message_id TEXT,
+                source_chat_id TEXT,
+                metadata_json TEXT DEFAULT '',
                 source_event_time TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
@@ -232,6 +239,8 @@ class DBManager:
                 quality_score REAL DEFAULT 0,
                 intent TEXT,
                 embedding TEXT,
+                source_buyer_message_id TEXT,
+                source_reply_message_id TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -279,9 +288,31 @@ class DBManager:
             )
             ''')
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_bootstrap_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                trigger_mode TEXT DEFAULT 'manual',
+                conversation_limit INTEGER DEFAULT 200,
+                message_limit_per_chat INTEGER DEFAULT 100,
+                imported_conversations INTEGER DEFAULT 0,
+                imported_messages INTEGER DEFAULT 0,
+                extracted_samples INTEGER DEFAULT 0,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                error_message TEXT,
+                progress_json TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup ON conversation_messages(cookie_id, chat_id, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_reply_style_samples_lookup ON reply_style_samples(cookie_id, is_active, created_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_reply_generation_traces_lookup ON reply_generation_traces(cookie_id, chat_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_bootstrap_jobs_lookup ON account_bootstrap_jobs(cookie_id, created_at DESC)')
 
             ai_settings_columns = [
                 ("base_prompt_overrides", "TEXT DEFAULT ''"),
@@ -304,6 +335,34 @@ class DBManager:
                     logger.info(f"正在为 ai_reply_settings 表添加 {column_name} 列...")
                     self._execute_sql(cursor, f"ALTER TABLE ai_reply_settings ADD COLUMN {column_name} {column_def}")
                     logger.info(f"ai_reply_settings 表 {column_name} 列添加完成")
+
+            conversation_message_columns = [
+                ("source_message_id", "TEXT"),
+                ("source_chat_id", "TEXT"),
+                ("metadata_json", "TEXT DEFAULT ''"),
+            ]
+            for column_name, column_def in conversation_message_columns:
+                try:
+                    self._execute_sql(cursor, f"SELECT {column_name} FROM conversation_messages LIMIT 1")
+                except sqlite3.OperationalError:
+                    logger.info(f"正在为 conversation_messages 表添加 {column_name} 列...")
+                    self._execute_sql(cursor, f"ALTER TABLE conversation_messages ADD COLUMN {column_name} {column_def}")
+                    logger.info(f"conversation_messages 表 {column_name} 列添加完成")
+
+            reply_style_sample_columns = [
+                ("source_buyer_message_id", "TEXT"),
+                ("source_reply_message_id", "TEXT"),
+            ]
+            for column_name, column_def in reply_style_sample_columns:
+                try:
+                    self._execute_sql(cursor, f"SELECT {column_name} FROM reply_style_samples LIMIT 1")
+                except sqlite3.OperationalError:
+                    logger.info(f"正在为 reply_style_samples 表添加 {column_name} 列...")
+                    self._execute_sql(cursor, f"ALTER TABLE reply_style_samples ADD COLUMN {column_name} {column_def}")
+                    logger.info(f"reply_style_samples 表 {column_name} 列添加完成")
+
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_messages_source_unique ON conversation_messages(cookie_id, chat_id, source_message_id)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_style_samples_source_unique ON reply_style_samples(cookie_id, chat_id, source_buyer_message_id, source_reply_message_id)')
 
             # 创建AI商品信息缓存表
             cursor.execute('''
@@ -2051,17 +2110,17 @@ class DBManager:
 
     def _normalize_ai_reply_settings(self, result: tuple, system_model: str, system_api_key: str, system_base_url: str) -> dict:
         """统一整理AI回复设置"""
-        DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        DEFAULT_MODEL = 'qwen-plus'
+        default_models = {DEFAULT_AI_MODEL, LEGACY_DEFAULT_AI_MODEL, '', None}
+        default_base_urls = {DEFAULT_AI_BASE_URL, LEGACY_DEFAULT_AI_BASE_URL, '', None}
 
         if result:
             account_model = result[1]
             account_api_key = result[2]
             account_base_url = result[3]
 
-            use_model = account_model if (account_model and account_model != DEFAULT_MODEL) else system_model
+            use_model = account_model if account_model not in default_models else system_model
             use_api_key = account_api_key if account_api_key else system_api_key
-            use_base_url = account_base_url if (account_base_url and account_base_url != DEFAULT_BASE_URL) else system_base_url
+            use_base_url = account_base_url if account_base_url not in default_base_urls else system_base_url
 
             custom_prompts = result[7] or ''
             base_prompt_overrides = result[8] or custom_prompts
@@ -2125,9 +2184,9 @@ class DBManager:
                 ''', (
                     cookie_id,
                     settings.get('ai_enabled', False),
-                    settings.get('model_name', 'qwen-plus'),
+                    settings.get('model_name', DEFAULT_AI_MODEL),
                     settings.get('api_key', ''),
-                    settings.get('base_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
+                    settings.get('base_url', DEFAULT_AI_BASE_URL),
                     settings.get('max_discount_percent', 10),
                     settings.get('max_discount_amount', 100),
                     settings.get('max_bargain_rounds', 3),
@@ -2159,10 +2218,6 @@ class DBManager:
         优先使用账号级别的设置，如果账号没有配置api_key/base_url/model_name，
         则从系统设置中读取全局AI配置作为默认值
         """
-        # 默认值常量，用于判断是否使用系统设置
-        DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        DEFAULT_MODEL = 'qwen-plus'
-        
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -2180,21 +2235,24 @@ class DBManager:
                 
                 # 获取系统级别的AI设置作为默认值
                 system_api_key = self.get_system_setting('ai_api_key') or ''
-                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_BASE_URL
-                system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
+                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_AI_BASE_URL
+                system_model = self.get_system_setting('ai_model') or DEFAULT_AI_MODEL
                 settings = self._normalize_ai_reply_settings(result, system_model, system_api_key, system_base_url)
                 settings['sample_stats'] = self.get_reply_style_stats(cookie_id)
                 profile = self.get_agent_profile(cookie_id)
                 if profile and not settings.get('agent_profile'):
                     settings['agent_profile'] = profile
+                bootstrap_summary = self.get_bootstrap_summary(cookie_id)
+                if bootstrap_summary:
+                    settings['training_status'] = bootstrap_summary
                 return settings
             except Exception as e:
                 logger.error(f"获取AI回复设置失败: {e}")
                 return {
                     'ai_enabled': False,
-                    'model_name': 'qwen-plus',
+                    'model_name': DEFAULT_AI_MODEL,
                     'api_key': '',
-                    'base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                    'base_url': DEFAULT_AI_BASE_URL,
                     'max_discount_percent': 10,
                     'max_discount_amount': 100,
                     'max_bargain_rounds': 3,
@@ -2210,7 +2268,7 @@ class DBManager:
                     'strategy_version': 'rag-v1',
                     'agent_profile': {},
                     'policy_flags': {},
-                    'training_status': {},
+                    'training_status': self.get_bootstrap_summary(cookie_id),
                     'sample_stats': self.get_reply_style_stats(cookie_id)
                 }
 
@@ -2229,17 +2287,16 @@ class DBManager:
                 FROM ai_reply_settings
                 ''')
 
-                DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-                DEFAULT_MODEL = 'qwen-plus'
                 system_api_key = self.get_system_setting('ai_api_key') or ''
-                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_BASE_URL
-                system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
+                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_AI_BASE_URL
+                system_model = self.get_system_setting('ai_model') or DEFAULT_AI_MODEL
 
                 result = {}
                 for row in cursor.fetchall():
                     cookie_id = row[0]
                     normalized = self._normalize_ai_reply_settings(row[1:], system_model, system_api_key, system_base_url)
                     normalized['sample_stats'] = self.get_reply_style_stats(cookie_id)
+                    normalized['training_status'] = self.get_bootstrap_summary(cookie_id)
                     result[cookie_id] = normalized
 
                 return result
@@ -2250,7 +2307,8 @@ class DBManager:
     def save_conversation_message(self, cookie_id: str, chat_id: str, item_id: str, sender_role: str,
                                   sender_id: str, content: str, message_type: str = 'text',
                                   reply_source: str = None, is_manual: bool = False,
-                                  source_event_time: str = None) -> Optional[int]:
+                                  source_event_time: str = None, source_message_id: str = None,
+                                  source_chat_id: str = None, metadata: Any = None) -> Optional[int]:
         """保存结构化会话消息"""
         if not content:
             return None
@@ -2259,16 +2317,28 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO conversation_messages
+                INSERT OR IGNORE INTO conversation_messages
                 (cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
-                 reply_source, is_manual, source_event_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 reply_source, is_manual, source_message_id, source_chat_id, metadata_json, source_event_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     cookie_id, chat_id, item_id, sender_role, sender_id, content,
-                    message_type or 'text', reply_source, bool(is_manual), source_event_time
+                    message_type or 'text', reply_source, bool(is_manual),
+                    source_message_id, source_chat_id or chat_id, self._safe_dump_json(metadata), source_event_time
                 ))
                 self.conn.commit()
-                return cursor.lastrowid
+                if cursor.lastrowid:
+                    return cursor.lastrowid
+                if source_message_id:
+                    cursor.execute('''
+                    SELECT id FROM conversation_messages
+                    WHERE cookie_id = ? AND chat_id = ? AND source_message_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    ''', (cookie_id, chat_id, source_message_id))
+                    row = cursor.fetchone()
+                    if row:
+                        return row[0]
+                return None
             except Exception as e:
                 logger.error(f"保存结构化会话消息失败: {e}")
                 self.conn.rollback()
@@ -2281,7 +2351,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
-                       reply_source, is_manual, source_event_time, created_at
+                       reply_source, is_manual, source_message_id, source_chat_id, metadata_json,
+                       source_event_time, created_at
                 FROM conversation_messages
                 WHERE cookie_id = ? AND chat_id = ?
                 ORDER BY created_at DESC, id DESC
@@ -2289,8 +2360,14 @@ class DBManager:
                 ''', (cookie_id, chat_id, limit))
                 rows = cursor.fetchall()
                 columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'sender_role', 'sender_id', 'content',
-                           'message_type', 'reply_source', 'is_manual', 'source_event_time', 'created_at']
-                return [dict(zip(columns, row)) for row in reversed(rows)]
+                           'message_type', 'reply_source', 'is_manual', 'source_message_id', 'source_chat_id',
+                           'metadata_json', 'source_event_time', 'created_at']
+                results = []
+                for row in reversed(rows):
+                    item = dict(zip(columns, row))
+                    item['metadata'] = self._safe_load_json(item.pop('metadata_json', ''), {})
+                    results.append(item)
+                return results
             except Exception as e:
                 logger.error(f"获取结构化会话消息失败: {e}")
                 return []
@@ -2303,7 +2380,8 @@ class DBManager:
                 if before_message_id:
                     cursor.execute('''
                     SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
-                           reply_source, is_manual, source_event_time, created_at
+                           reply_source, is_manual, source_message_id, source_chat_id, metadata_json,
+                           source_event_time, created_at
                     FROM conversation_messages
                     WHERE cookie_id = ? AND chat_id = ? AND sender_role = 'buyer' AND id < ?
                     ORDER BY id DESC LIMIT 1
@@ -2311,7 +2389,8 @@ class DBManager:
                 else:
                     cursor.execute('''
                     SELECT id, cookie_id, chat_id, item_id, sender_role, sender_id, content, message_type,
-                           reply_source, is_manual, source_event_time, created_at
+                           reply_source, is_manual, source_message_id, source_chat_id, metadata_json,
+                           source_event_time, created_at
                     FROM conversation_messages
                     WHERE cookie_id = ? AND chat_id = ? AND sender_role = 'buyer'
                     ORDER BY id DESC LIMIT 1
@@ -2322,30 +2401,48 @@ class DBManager:
                     return None
 
                 columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'sender_role', 'sender_id', 'content',
-                           'message_type', 'reply_source', 'is_manual', 'source_event_time', 'created_at']
-                return dict(zip(columns, row))
+                           'message_type', 'reply_source', 'is_manual', 'source_message_id', 'source_chat_id',
+                           'metadata_json', 'source_event_time', 'created_at']
+                item = dict(zip(columns, row))
+                item['metadata'] = self._safe_load_json(item.pop('metadata_json', ''), {})
+                return item
             except Exception as e:
                 logger.error(f"查找最近买家消息失败: {e}")
                 return None
 
     def save_reply_style_sample(self, cookie_id: str, chat_id: str, item_id: str, buyer_message: str,
                                 human_reply: str, source: str = 'manual', quality_score: float = 0.0,
-                                intent: str = None, embedding: Any = None, is_active: bool = True) -> Optional[int]:
+                                intent: str = None, embedding: Any = None, is_active: bool = True,
+                                source_buyer_message_id: str = None, source_reply_message_id: str = None) -> Optional[int]:
         """保存风格样本"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO reply_style_samples
+                INSERT OR IGNORE INTO reply_style_samples
                 (cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
-                 intent, embedding, is_active, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 intent, embedding, source_buyer_message_id, source_reply_message_id, is_active, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
-                    intent, self._safe_dump_json(embedding), bool(is_active)
+                    intent, self._safe_dump_json(embedding), source_buyer_message_id,
+                    source_reply_message_id, bool(is_active)
                 ))
                 self.conn.commit()
-                return cursor.lastrowid
+                if cursor.lastrowid:
+                    return cursor.lastrowid
+                if source_buyer_message_id or source_reply_message_id:
+                    cursor.execute('''
+                    SELECT id FROM reply_style_samples
+                    WHERE cookie_id = ? AND chat_id = ?
+                      AND COALESCE(source_buyer_message_id, '') = COALESCE(?, '')
+                      AND COALESCE(source_reply_message_id, '') = COALESCE(?, '')
+                    ORDER BY id DESC LIMIT 1
+                    ''', (cookie_id, chat_id, source_buyer_message_id, source_reply_message_id))
+                    row = cursor.fetchone()
+                    if row:
+                        return row[0]
+                return None
             except Exception as e:
                 logger.error(f"保存风格样本失败: {e}")
                 self.conn.rollback()
@@ -2362,7 +2459,8 @@ class DBManager:
                     where_sql += " AND is_active = 1"
                 cursor.execute(f'''
                 SELECT id, cookie_id, chat_id, item_id, buyer_message, human_reply, source, quality_score,
-                       intent, embedding, is_active, created_at, updated_at
+                       intent, embedding, source_buyer_message_id, source_reply_message_id,
+                       is_active, created_at, updated_at
                 FROM reply_style_samples
                 {where_sql}
                 ORDER BY quality_score DESC, created_at DESC
@@ -2370,7 +2468,8 @@ class DBManager:
                 ''', (*params, limit))
                 rows = cursor.fetchall()
                 columns = ['id', 'cookie_id', 'chat_id', 'item_id', 'buyer_message', 'human_reply', 'source',
-                           'quality_score', 'intent', 'embedding', 'is_active', 'created_at', 'updated_at']
+                           'quality_score', 'intent', 'embedding', 'source_buyer_message_id',
+                           'source_reply_message_id', 'is_active', 'created_at', 'updated_at']
                 results = []
                 for row in rows:
                     item = dict(zip(columns, row))
@@ -2431,6 +2530,12 @@ class DBManager:
                 cursor.execute('SELECT COUNT(*) FROM reply_generation_traces WHERE cookie_id = ?', (cookie_id,))
                 trace_row = cursor.fetchone()
                 stats['trace_count'] = trace_row[0] if trace_row else 0
+
+                bootstrap_summary = self.get_bootstrap_summary(cookie_id)
+                stats['bootstrap_status'] = bootstrap_summary.get('status', 'idle')
+                stats['last_bootstrap_at'] = bootstrap_summary.get('finished_at') or bootstrap_summary.get('updated_at')
+                stats['imported_conversations'] = bootstrap_summary.get('imported_conversations', 0)
+                stats['imported_messages'] = bootstrap_summary.get('imported_messages', 0)
 
                 return stats
             except Exception as e:
@@ -2567,6 +2672,162 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取账号画像失败: {e}")
                 return {}
+
+    def set_ai_training_status(self, cookie_id: str, training_status: Dict[str, Any]) -> bool:
+        """更新账号训练/初始化状态快照"""
+        settings = self.get_ai_reply_settings(cookie_id)
+        settings['training_status'] = training_status or {}
+        return self.save_ai_reply_settings(cookie_id, settings)
+
+    def create_account_bootstrap_job(self, cookie_id: str, trigger_mode: str = 'manual',
+                                     conversation_limit: int = 200, message_limit_per_chat: int = 100) -> Optional[int]:
+        """创建账号初始化任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO account_bootstrap_jobs
+                (cookie_id, status, trigger_mode, conversation_limit, message_limit_per_chat,
+                 progress_json, started_at, updated_at)
+                VALUES (?, 'pending', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ''', (
+                    cookie_id,
+                    trigger_mode,
+                    conversation_limit,
+                    message_limit_per_chat,
+                    self._safe_dump_json({
+                        'status': 'pending',
+                        'cookie_id': cookie_id,
+                        'conversation_limit': conversation_limit,
+                        'message_limit_per_chat': message_limit_per_chat,
+                        'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    }),
+                ))
+                self.conn.commit()
+                job_id = cursor.lastrowid
+                self.set_ai_training_status(cookie_id, self.get_bootstrap_summary(cookie_id))
+                return job_id
+            except Exception as e:
+                logger.error(f"创建账号初始化任务失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def update_account_bootstrap_job(self, job_id: int, **fields) -> bool:
+        """更新账号初始化任务"""
+        if not job_id:
+            return False
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT cookie_id, progress_json FROM account_bootstrap_jobs WHERE id = ?', (job_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+
+                cookie_id = row[0]
+                current_progress = self._safe_load_json(row[1], {}) if len(row) > 1 else {}
+                progress_json = fields.pop('progress_json', None)
+                if isinstance(progress_json, dict):
+                    merged_progress = {**current_progress, **progress_json}
+                elif progress_json in (None, ''):
+                    merged_progress = current_progress
+                else:
+                    merged_progress = self._safe_load_json(progress_json, current_progress)
+
+                if merged_progress:
+                    merged_progress['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+                set_clauses = []
+                params: List[Any] = []
+                allowed_fields = [
+                    'status', 'trigger_mode', 'conversation_limit', 'message_limit_per_chat',
+                    'imported_conversations', 'imported_messages', 'extracted_samples',
+                    'finished_at', 'error_message',
+                ]
+                for key in allowed_fields:
+                    if key in fields:
+                        set_clauses.append(f"{key} = ?")
+                        params.append(fields[key])
+
+                set_clauses.append('progress_json = ?')
+                params.append(self._safe_dump_json(merged_progress))
+                set_clauses.append('updated_at = CURRENT_TIMESTAMP')
+
+                cursor.execute(
+                    f"UPDATE account_bootstrap_jobs SET {', '.join(set_clauses)} WHERE id = ?",
+                    (*params, job_id)
+                )
+                self.conn.commit()
+                self.set_ai_training_status(cookie_id, self.get_bootstrap_summary(cookie_id))
+                return True
+            except Exception as e:
+                logger.error(f"更新账号初始化任务失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_latest_account_bootstrap_job(self, cookie_id: str) -> Dict[str, Any]:
+        """获取账号最近一次初始化任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT id, cookie_id, status, trigger_mode, conversation_limit, message_limit_per_chat,
+                       imported_conversations, imported_messages, extracted_samples,
+                       started_at, finished_at, error_message, progress_json, created_at, updated_at
+                FROM account_bootstrap_jobs
+                WHERE cookie_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                ''', (cookie_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return {}
+
+                columns = [
+                    'id', 'cookie_id', 'status', 'trigger_mode', 'conversation_limit',
+                    'message_limit_per_chat', 'imported_conversations', 'imported_messages',
+                    'extracted_samples', 'started_at', 'finished_at', 'error_message',
+                    'progress_json', 'created_at', 'updated_at'
+                ]
+                item = dict(zip(columns, row))
+                item['progress'] = self._safe_load_json(item.pop('progress_json', ''), {})
+                return item
+            except Exception as e:
+                logger.error(f"获取账号初始化任务失败: {e}")
+                return {}
+
+    def get_bootstrap_summary(self, cookie_id: str) -> Dict[str, Any]:
+        """获取账号初始化状态快照"""
+        job = self.get_latest_account_bootstrap_job(cookie_id)
+        if not job:
+            return {
+                'status': 'idle',
+                'cookie_id': cookie_id,
+                'imported_conversations': 0,
+                'imported_messages': 0,
+                'extracted_samples': 0,
+                'progress': {},
+            }
+
+        summary = {
+            'job_id': job.get('id'),
+            'cookie_id': cookie_id,
+            'status': job.get('status', 'idle'),
+            'trigger_mode': job.get('trigger_mode', 'manual'),
+            'conversation_limit': job.get('conversation_limit', 200),
+            'message_limit_per_chat': job.get('message_limit_per_chat', 100),
+            'imported_conversations': job.get('imported_conversations', 0) or 0,
+            'imported_messages': job.get('imported_messages', 0) or 0,
+            'extracted_samples': job.get('extracted_samples', 0) or 0,
+            'started_at': job.get('started_at'),
+            'finished_at': job.get('finished_at'),
+            'error_message': job.get('error_message'),
+            'updated_at': job.get('updated_at'),
+            'progress': job.get('progress', {}),
+        }
+        summary.update(job.get('progress', {}))
+        return summary
 
     # -------------------- 默认回复操作 --------------------
     def save_default_reply(self, cookie_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False, reply_image_url: str = None, item_id: str = None):
@@ -3053,7 +3314,8 @@ class DBManager:
                         related_tables = ['cookie_status', 'default_replies', 'message_notifications',
                                         'item_info', 'ai_reply_settings', 'ai_conversations',
                                         'conversation_messages', 'reply_style_samples',
-                                        'agent_profiles', 'reply_generation_traces']
+                                        'agent_profiles', 'reply_generation_traces',
+                                        'account_bootstrap_jobs']
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -3071,7 +3333,8 @@ class DBManager:
                         'message_notifications', 'system_settings', 'item_info',
                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
                         'conversation_messages', 'reply_style_samples',
-                        'agent_profiles', 'reply_generation_traces'
+                        'agent_profiles', 'reply_generation_traces',
+                        'account_bootstrap_jobs'
                     ]
 
                     for table in tables:
@@ -3116,7 +3379,8 @@ class DBManager:
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
                                         'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings',
                                         'conversation_messages', 'reply_style_samples',
-                                        'agent_profiles', 'reply_generation_traces']
+                                        'agent_profiles', 'reply_generation_traces',
+                                        'account_bootstrap_jobs']
 
                         for table in related_tables:
                             cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -3130,7 +3394,8 @@ class DBManager:
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
                         'ai_conversations', 'ai_reply_settings', 'ai_item_cache',
                         'conversation_messages', 'reply_style_samples',
-                        'agent_profiles', 'reply_generation_traces', 'cookies'
+                        'agent_profiles', 'reply_generation_traces', 'account_bootstrap_jobs',
+                        'cookies'
                     ]
 
                     for table in tables:
@@ -3147,7 +3412,8 @@ class DBManager:
                                         'message_notifications', 'system_settings', 'item_info',
                                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
                                         'conversation_messages', 'reply_style_samples',
-                                        'agent_profiles', 'reply_generation_traces']:
+                                        'agent_profiles', 'reply_generation_traces',
+                                        'account_bootstrap_jobs']:
                         continue
 
                     columns = table_data['columns']
@@ -5254,6 +5520,7 @@ class DBManager:
                 cursor.execute('DELETE FROM reply_style_samples WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
                 cursor.execute('DELETE FROM agent_profiles WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
                 cursor.execute('DELETE FROM reply_generation_traces WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
+                cursor.execute('DELETE FROM account_bootstrap_jobs WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
                 cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
                 # 6. 删除用户的Cookie
@@ -5526,6 +5793,7 @@ class DBManager:
                     'reply_style_samples': 'id',
                     'agent_profiles': 'cookie_id',
                     'reply_generation_traces': 'id',
+                    'account_bootstrap_jobs': 'id',
                     'item_info': 'id',
                     'message_notifications': 'id',
                     'cards': 'id',
@@ -6034,6 +6302,16 @@ class DBManager:
                 except Exception as e:
                     logger.warning(f"清理AI trace失败: {e}")
                     stats['reply_generation_traces'] = 0
+
+                try:
+                    cursor.execute(
+                        "DELETE FROM account_bootstrap_jobs WHERE created_at < datetime('now', '-' || ? || ' days')",
+                        (days,)
+                    )
+                    stats['account_bootstrap_jobs'] = cursor.rowcount
+                except Exception as e:
+                    logger.warning(f"清理账号初始化任务失败: {e}")
+                    stats['account_bootstrap_jobs'] = 0
                 
                 # 清理风控日志（保留最近90天）
                 try:

@@ -171,6 +171,10 @@ export interface AISampleStats {
   latest_profile_version?: number | null
   last_profile_status?: string
   trace_count: number
+  bootstrap_status?: string
+  last_bootstrap_at?: string
+  imported_conversations?: number
+  imported_messages?: number
 }
 
 export interface AITrace {
@@ -208,6 +212,38 @@ export interface AIReplySettings {
   sample_stats?: AISampleStats
   // 兼容旧字段（前端内部使用）
   enabled?: boolean
+}
+
+export interface AIBootstrapStatus {
+  job_id?: number
+  cookie_id: string
+  status: string
+  trigger_mode?: string
+  conversation_limit?: number
+  message_limit_per_chat?: number
+  imported_conversations?: number
+  imported_messages?: number
+  extracted_samples?: number
+  started_at?: string
+  finished_at?: string
+  error_message?: string
+  updated_at?: string
+  progress?: Record<string, unknown>
+  current_step?: string
+  warnings?: string[]
+}
+
+export interface AIHistoryImportResult {
+  success: boolean
+  message?: string
+  imported_conversations: number
+  imported_messages: number
+  extracted_samples: number
+  agent_profile?: AgentProfile
+  training_status?: Record<string, unknown>
+  sample_stats?: AISampleStats
+  bootstrap_status?: AIBootstrapStatus
+  warnings?: string[]
 }
 
 // 获取AI回复设置
@@ -269,10 +305,45 @@ export const rebuildAIReplyProfile = (cookieId: string): Promise<{
   return post(`/ai-agent/${cookieId}/rebuild-profile`)
 }
 
+export const bootstrapAIAgent = (cookieId: string, payload?: {
+  conversation_limit?: number
+  message_limit_per_chat?: number
+  force_rebuild?: boolean
+}): Promise<AIBootstrapStatus & { success: boolean; message?: string }> => {
+  return post(`/ai-agent/${cookieId}/bootstrap`, {
+    conversation_limit: payload?.conversation_limit ?? 200,
+    message_limit_per_chat: payload?.message_limit_per_chat ?? 100,
+    force_rebuild: payload?.force_rebuild ?? false,
+  })
+}
+
+export const getAIBootstrapStatus = (cookieId: string): Promise<AIBootstrapStatus> => {
+  return get(`/ai-agent/${cookieId}/bootstrap-status`)
+}
+
+export const importAIAgentHistory = async (
+  cookieId: string,
+  file: File,
+  payload?: {
+    force_rebuild?: boolean
+  },
+): Promise<AIHistoryImportResult> => {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('force_rebuild', String(payload?.force_rebuild ?? false))
+  return post(`/ai-agent/${cookieId}/import-history`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+}
+
 export const getAIAgentStats = (cookieId: string): Promise<{
   cookie_id: string
   sample_stats: AISampleStats
   training_status?: Record<string, unknown>
+  bootstrap_status?: AIBootstrapStatus
+  last_bootstrap_at?: string
+  imported_conversations?: number
+  imported_messages?: number
   prompt_version?: string
   strategy_version?: string
   recent_traces?: AITrace[]

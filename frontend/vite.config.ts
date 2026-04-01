@@ -123,6 +123,10 @@ export default defineConfig(({ command }) => ({
         target: 'http://localhost:8080',
         changeOrigin: true,
       },
+      '/ai-agent': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      },
       '/password-login': {
         target: 'http://localhost:8080',
         changeOrigin: true,
